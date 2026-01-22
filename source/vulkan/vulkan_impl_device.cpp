@@ -8,6 +8,7 @@
 #include "vulkan_impl_type_convert.hpp"
 #include "dll_log.hpp"
 #include <cstring> // std::memcpy
+#include <string>
 #include <algorithm> // std::copy_n, std::max
 
 #define vk _dispatch_table
@@ -844,7 +845,7 @@ bool reshade::vulkan::device_impl::create_resource_view(api::resource resource, 
 		{
 			convert_usage_to_image_usage_flags(usage_type, usage_info.usage);
 
-			create_info.pNext = &usage_info;
+				create_info.pNext = &usage_info;
 		}
 
 		VkImageView image_view = VK_NULL_HANDLE;
@@ -1271,7 +1272,6 @@ bool reshade::vulkan::device_impl::create_shader_module(VkShaderStageFlagBits st
 	spec_info.pMapEntries = spec_map.data();
 	spec_info.dataSize = desc.spec_constants * sizeof(uint32_t);
 	spec_info.pData = desc.spec_constant_values;
-
 	stage_info = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
 	stage_info.stage = stage;
 	stage_info.pName = desc.entry_point != nullptr ? desc.entry_point : "main";
@@ -1842,6 +1842,7 @@ bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, 
 
 #if VK_KHR_dynamic_rendering
 		VkPipelineRenderingCreateInfo dynamic_rendering_info;
+		VkRenderingInputAttachmentIndexInfo input_attachment_info;
 		if (vk.KHR_dynamic_rendering)
 		{
 			dynamic_rendering_info = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
@@ -1854,6 +1855,54 @@ bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, 
 				dynamic_rendering_info.depthAttachmentFormat = depth_stencil_format_vk;
 			if (aspect_flags_from_format(depth_stencil_format_vk) & VK_IMAGE_ASPECT_STENCIL_BIT)
 				dynamic_rendering_info.stencilAttachmentFormat = depth_stencil_format_vk;
+
+			temp_mem<uint32_t, 8> input_attachment_indices(dynamic_rendering_info.colorAttachmentCount);
+			uint32_t depth_input_index = VK_ATTACHMENT_UNUSED;
+			uint32_t stencil_input_index = VK_ATTACHMENT_UNUSED;
+			if (_dynamic_rendering_local_read)
+			{
+				for (uint32_t i = 0; i < dynamic_rendering_info.colorAttachmentCount; ++i)
+					input_attachment_indices[i] = VK_ATTACHMENT_UNUSED;
+
+				bool has_input_indices = false;
+				uint32_t pending_color_count = 0;
+				temp_mem<uint32_t, 8> pending_input_indices(dynamic_rendering_info.colorAttachmentCount);
+				uint32_t pending_depth_input_index = VK_ATTACHMENT_UNUSED;
+				uint32_t pending_stencil_input_index = VK_ATTACHMENT_UNUSED;
+				if (consume_pending_rendering_input_attachment_indices(
+						pending_color_count,
+						pending_input_indices.p,
+						pending_depth_input_index,
+						pending_stencil_input_index))
+				{
+					uint32_t copy_count = dynamic_rendering_info.colorAttachmentCount;
+					if (copy_count > pending_color_count)
+						copy_count = pending_color_count;
+					for (uint32_t i = 0; i < copy_count; ++i)
+					{
+						input_attachment_indices[i] = pending_input_indices[i];
+						if (pending_input_indices[i] != VK_ATTACHMENT_UNUSED)
+							has_input_indices = true;
+					}
+					depth_input_index = pending_depth_input_index;
+					stencil_input_index = pending_stencil_input_index;
+
+					if (depth_input_index != VK_ATTACHMENT_UNUSED || stencil_input_index != VK_ATTACHMENT_UNUSED)
+						has_input_indices = true;
+				}
+
+				if (has_input_indices)
+				{
+					input_attachment_info = { VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO };
+					input_attachment_info.pNext = dynamic_rendering_info.pNext;
+					input_attachment_info.colorAttachmentCount = dynamic_rendering_info.colorAttachmentCount;
+					input_attachment_info.pColorAttachmentInputIndices = input_attachment_indices.p;
+					input_attachment_info.pDepthInputAttachmentIndex = &depth_input_index;
+					input_attachment_info.pStencilInputAttachmentIndex = &stencil_input_index;
+
+					dynamic_rendering_info.pNext = &input_attachment_info;
+				}
+			}
 
 			create_info.pNext = &dynamic_rendering_info;
 		}
@@ -1969,6 +2018,113 @@ exit_failure:
 void reshade::vulkan::device_impl::destroy_pipeline(api::pipeline pipeline)
 {
 	vk.DestroyPipeline(_orig, (VkPipeline)pipeline.handle, nullptr);
+}
+
+static bool compare_descriptor_range(const reshade::api::descriptor_range &lhs, const reshade::api::descriptor_range &rhs)
+{
+	return lhs.binding == rhs.binding &&
+		lhs.dx_register_index == rhs.dx_register_index &&
+		lhs.dx_register_space == rhs.dx_register_space &&
+		lhs.count == rhs.count &&
+		lhs.array_size == rhs.array_size &&
+		lhs.type == rhs.type &&
+		lhs.visibility == rhs.visibility;
+}
+
+static bool compare_static_samplers(const reshade::api::sampler_desc *lhs, const std::vector<reshade::api::sampler_desc> &rhs, uint32_t count)
+{
+	if (lhs == nullptr)
+		return rhs.empty();
+	if (rhs.size() != count)
+		return false;
+
+	for (uint32_t i = 0; i < count; ++i)
+	{
+		if (std::memcmp(&lhs[i], &rhs[i], sizeof(reshade::api::sampler_desc)) != 0)
+			return false;
+	}
+
+	return true;
+}
+
+static bool matches_descriptor_set_layout(
+	const reshade::vulkan::object_data<VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT> &data,
+	const reshade::api::descriptor_range_with_static_samplers *ranges,
+	uint32_t range_count,
+	bool push_descriptors,
+	bool with_static_samplers)
+{
+	if (data.push_descriptors != push_descriptors)
+		return false;
+
+	if (with_static_samplers)
+	{
+		if (data.ranges_with_static_samplers.size() != range_count || data.static_samplers.size() != range_count)
+			return false;
+
+		for (uint32_t i = 0; i < range_count; ++i)
+		{
+			if (!compare_descriptor_range(data.ranges_with_static_samplers[i], *static_cast<const reshade::api::descriptor_range *>(&ranges[i])))
+				return false;
+			if (!compare_static_samplers(ranges[i].static_samplers, data.static_samplers[i], ranges[i].count))
+				return false;
+		}
+
+		return true;
+	}
+
+	if (data.ranges.size() != range_count)
+		return false;
+
+	for (uint32_t i = 0; i < range_count; ++i)
+	{
+		if (!compare_descriptor_range(data.ranges[i], *static_cast<const reshade::api::descriptor_range *>(&ranges[i])))
+			return false;
+	}
+
+	return true;
+}
+
+static bool matches_descriptor_set_layout_binding_flags(
+	const reshade::vulkan::object_data<VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT> &data,
+	const std::vector<VkDescriptorBindingFlags> *binding_flags_by_binding_ptr)
+{
+	if (binding_flags_by_binding_ptr == nullptr || binding_flags_by_binding_ptr->empty())
+		return true;
+
+	const auto &flags = *binding_flags_by_binding_ptr;
+	for (size_t binding = 0; binding < flags.size(); ++binding)
+	{
+		const VkDescriptorBindingFlags expected = flags[binding];
+		if (expected == 0)
+			continue;
+		if (binding >= data.binding_flags.size())
+			return false;
+		if (data.binding_flags[binding] != expected)
+			return false;
+	}
+
+	return true;
+}
+
+void reshade::vulkan::device_impl::set_pending_set_layout_binding_flags(std::vector<std::vector<VkDescriptorBindingFlags>> &&flags)
+{
+	const std::unique_lock<std::shared_mutex> lock(_mutex);
+	_pending_set_layout_binding_flags = flags;
+}
+
+void reshade::vulkan::device_impl::clear_pending_set_layout_binding_flags()
+{
+	const std::unique_lock<std::shared_mutex> lock(_mutex);
+	_pending_set_layout_binding_flags.clear();
+}
+
+std::vector<VkDescriptorBindingFlags> reshade::vulkan::device_impl::get_pending_set_layout_binding_flags(uint32_t set_index)
+{
+	std::shared_lock<std::shared_mutex> lock(_mutex);
+	if (set_index >= _pending_set_layout_binding_flags.size())
+		return {};
+	return _pending_set_layout_binding_flags[set_index];
 }
 
 bool reshade::vulkan::device_impl::create_pipeline_layout(uint32_t param_count, const api::pipeline_layout_param *params, api::pipeline_layout *out_layout)

@@ -33,8 +33,7 @@ void create_default_view(reshade::vulkan::device_impl *device_impl, VkImage imag
 	assert(data->default_view == VK_NULL_HANDLE);
 
 	// Need to create a default view that is used in 'vkCmdClearColorImage' and 'vkCmdClearDepthStencilImage'
-	if ((data->create_info.usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) != 0 &&
-		(data->create_info.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0)
+	if ((data->create_info.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0)
 	{
 		VkImageViewCreateInfo default_view_info { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
 		default_view_info.image = image;
@@ -267,7 +266,6 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 #if VK_EXT_conservative_rasterization
 		conservative_rasterization_ext = add_extension(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME, false);
 #endif
-
 #if 0
 		ray_tracing_ext =
 			add_extension(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME, false) &&
@@ -303,7 +301,7 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 			add_extension(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME, true);
 			add_extension(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, true);
 #endif
-		}
+	}
 	}
 
 	VkDeviceCreateInfo create_info = *pCreateInfo;
@@ -801,6 +799,72 @@ void     VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks
 	trampoline(device, pAllocator);
 }
 
+static const VkFormat g_formats_to_upgrade[] = {
+	VK_FORMAT_R8G8B8A8_SNORM,
+	VK_FORMAT_R8G8B8A8_UNORM,
+	VK_FORMAT_R8G8B8A8_SRGB,
+	VK_FORMAT_B8G8R8A8_UNORM,
+	VK_FORMAT_B8G8R8A8_SRGB,
+	VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+	VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+	VK_FORMAT_A8B8G8R8_UNORM_PACK32,
+	VK_FORMAT_A8B8G8R8_SRGB_PACK32,
+	VK_FORMAT_B8G8R8A8_SNORM,
+};
+
+const size_t g_formats_to_upgrade_count =
+	sizeof(g_formats_to_upgrade) / sizeof(g_formats_to_upgrade[0]);
+
+const VkFormat target_hdr_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+
+inline bool ShouldUpgradeFormat(VkFormat fmt)
+{
+	for (size_t i = 0; i < g_formats_to_upgrade_count; i++)
+	{
+		if (g_formats_to_upgrade[i] == fmt)
+			return true;
+	}
+	return false;
+}
+
+static void ModifyAttachments(VkRenderPassCreateInfo* createInfo)
+{
+	if (!createInfo || createInfo->attachmentCount == 0)
+		return;
+
+	// Track which attachments are specifically used as Color Render Targets
+	std::vector<bool> isColorRT(createInfo->attachmentCount, false);
+
+	for (uint32_t i = 0; i < createInfo->subpassCount; i++)
+	{
+		const VkSubpassDescription& subpass = createInfo->pSubpasses[i];
+
+		// Mark attachments used in the color role
+		for (uint32_t j = 0; j < subpass.colorAttachmentCount; j++)
+		{
+			uint32_t idx = subpass.pColorAttachments[j].attachment;
+			if (idx != VK_ATTACHMENT_UNUSED)
+			{
+				isColorRT[idx] = true;
+			}
+		}
+
+		// Note: We ignore subpass.pDepthStencilAttachment here
+		// to ensure depth-stencil textures are not upgraded.
+	}
+
+	auto* attachments = const_cast<VkAttachmentDescription*>(createInfo->pAttachments);
+
+	for (uint32_t i = 0; i < createInfo->attachmentCount; i++)
+	{
+		// Only upgrade if it's a Color RT and matches your upgrade list
+		if (isColorRT[i] && ShouldUpgradeFormat(attachments[i].format))
+		{
+			attachments[i].format = target_hdr_format;
+		}
+	}
+}
+
 VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubmits, VkFence fence)
 {
 	assert(pSubmits != nullptr || submitCount == 0);
@@ -1177,6 +1241,7 @@ VkResult VKAPI_CALL vkCreateImage(VkDevice device, const VkImageCreateInfo *pCre
 
 #if RESHADE_ADDON
 	VkImageCreateInfo create_info = *pCreateInfo;
+	create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	auto desc = reshade::vulkan::convert_resource_desc(create_info);
 	assert(desc.heap == reshade::api::memory_heap::unknown);
 
@@ -1247,6 +1312,15 @@ VkResult VKAPI_CALL vkCreateImageView(VkDevice device, const VkImageViewCreateIn
 	{
 		reshade::vulkan::convert_resource_view_desc(desc, create_info);
 		pCreateInfo = &create_info;
+
+		if (const auto format_list_info = find_in_structure_chain<VkImageFormatListCreateInfo>(
+		pCreateInfo->pNext, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO))
+		{
+			// Remove format list info if format was overriden
+			if (std::find(format_list_info->pViewFormats, format_list_info->pViewFormats + format_list_info->viewFormatCount, create_info.format) == (format_list_info->pViewFormats + format_list_info->viewFormatCount))
+				// This is evil, because writing into application memory, but it is what it is
+					const_cast<VkImageFormatListCreateInfo *>(format_list_info)->viewFormatCount = 0;
+		}
 	}
 #endif
 
@@ -1550,7 +1624,7 @@ VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache p
 					depth_stencil_format = reshade::vulkan::convert_format(dynamic_rendering_info->depthAttachmentFormat);
 				else
 					depth_stencil_format = reshade::vulkan::convert_format(dynamic_rendering_info->stencilAttachmentFormat);
-			}
+				}
 
 			sample_mask = (create_info.pMultisampleState != nullptr && create_info.pMultisampleState->pSampleMask != nullptr) ? *create_info.pMultisampleState->pSampleMask : UINT32_MAX;
 			sample_count = (create_info.pMultisampleState != nullptr) ? static_cast<uint32_t>(create_info.pMultisampleState->rasterizationSamples) : 1;
@@ -1881,6 +1955,32 @@ void     VKAPI_CALL vkDestroyPipeline(VkDevice device, VkPipeline pipeline, cons
 		return;
 
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(device));
+	auto* pd = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_PIPELINE, true>(pipeline);
+
+	if (pd != nullptr)
+	{
+		const std::lock_guard<std::mutex> lock(*pd->dynamic_rendering_mutex);
+		if (!pd->dynamic_rendering_pipelines.empty())
+		{
+			for (VkPipeline clone : pd->dynamic_rendering_pipelines)
+			{
+				device_impl->_dispatch_table.DestroyPipeline(
+						device_impl->_orig,
+						clone,
+						pAllocator);
+			}
+
+			reshade::log::message(reshade::log::level::info, "Destroy cloned pipelines");
+			reshade::log::message(
+				reshade::log::level::info,
+				"  | Pipeline         | %p |",
+				reinterpret_cast<void *>(pipeline));
+
+			pd->dynamic_rendering_pipelines.clear();
+			pd->dynamic_rendering_signatures.clear();
+		}
+	}
+
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(DestroyPipeline, device_impl);
 
 #if RESHADE_ADDON >= 2
@@ -2196,7 +2296,6 @@ VkResult VKAPI_CALL vkCreateDescriptorPool(VkDevice device, const VkDescriptorPo
 	for (uint32_t i = 0; i < pCreateInfo->poolSizeCount; ++i)
 		data.max_descriptors += pCreateInfo->pPoolSizes[i].descriptorCount;
 #endif
-
 	return result;
 }
 void     VKAPI_CALL vkDestroyDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, const VkAllocationCallbacks *pAllocator)
@@ -2239,7 +2338,7 @@ VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice device, const VkDescriptor
 	if (result < VK_SUCCESS)
 	{
 #if RESHADE_VERBOSE_LOG
-		reshade::log::message(reshade::log::level::warning, "vkAllocateDescriptorSets failed with error code %d.", static_cast<int>(result));
+		// reshade::log::message(reshade::log::level::warning, "vkAllocateDescriptorSets failed with error code %d.", static_cast<int>(result));
 #endif
 		return result;
 	}
@@ -2254,7 +2353,6 @@ VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice device, const VkDescriptor
 		reshade::vulkan::object_data<VK_OBJECT_TYPE_DESCRIPTOR_SET> *data = &pool_data->sets[pool_data->next_set++];
 		data->pool = pAllocateInfo->descriptorPool;
 		data->layout = pAllocateInfo->pSetLayouts[i];
-
 		data->offset = pool_data->next_offset;
 		pool_data->next_offset += layout_data->num_descriptors;
 

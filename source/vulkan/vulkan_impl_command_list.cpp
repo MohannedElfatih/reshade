@@ -843,8 +843,9 @@ void reshade::vulkan::command_list_impl::copy_texture_region(api::resource src, 
 	const auto src_data = _device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>((VkImage)src.handle);
 	const auto dst_data = _device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>((VkImage)dst.handle);
 
-	if ((src_box == nullptr && dst_box == nullptr && std::memcmp(&src_data->create_info.extent, &dst_data->create_info.extent, sizeof(VkExtent3D)) == 0) ||
-		(src_box != nullptr && dst_box != nullptr && src_box->width() == dst_box->width() && src_box->height() == dst_box->height() && src_box->depth() == dst_box->depth()))
+	if ((src_data->create_info.format == dst_data->create_info.format) &&
+		((src_box == nullptr && dst_box == nullptr && std::memcmp(&src_data->create_info.extent, &dst_data->create_info.extent, sizeof(VkExtent3D)) == 0) ||
+		(src_box != nullptr && dst_box != nullptr && src_box->width() == dst_box->width() && src_box->height() == dst_box->height() && src_data && src_box->depth() == dst_box->depth())))
 	{
 		VkImageCopy region;
 
@@ -1156,7 +1157,7 @@ void reshade::vulkan::command_list_impl::clear_render_target_view(api::resource_
 {
 	_has_commands = true;
 
-	assert(rect_count == 0);
+	// assert(rect_count == 0);
 
 	const auto view_data = _device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE_VIEW>((VkImageView)rtv.handle);
 
