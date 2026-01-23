@@ -2067,7 +2067,25 @@ VkResult VKAPI_CALL vkCreatePipelineLayout(VkDevice device, const VkPipelineLayo
 
 		assert(pCreateInfo->pNext == nullptr); // 'device_impl::create_pipeline_layout' does not support extension structures
 
-		result = device_impl->create_pipeline_layout(param_count, param_data, reinterpret_cast<reshade::api::pipeline_layout *>(pPipelineLayout)) ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+		std::vector<reshade::vulkan::device_impl::set_layout_flags_info> set_layout_flags;
+		set_layout_flags.reserve(set_desc_count);
+
+		for (uint32_t i = 0; i < set_desc_count; ++i)
+		{
+			reshade::vulkan::device_impl::set_layout_flags_info flags_info;
+
+			if (pCreateInfo->pSetLayouts[i] != VK_NULL_HANDLE)
+			{
+				const auto set_layout_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT>(pCreateInfo->pSetLayouts[i]);
+				flags_info.create_flags = set_layout_impl->create_flags;
+				flags_info.binding_flags = set_layout_impl->binding_flags;
+				flags_info.immutable_sampler_handles = set_layout_impl->immutable_sampler_handles;
+			}
+
+			set_layout_flags.push_back(std::move(flags_info));
+		}
+
+		result = device_impl->create_pipeline_layout_with_flags(param_count, param_data, set_layout_flags, reinterpret_cast<reshade::api::pipeline_layout *>(pPipelineLayout)) ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
 	}
 	else
 #endif
@@ -2187,6 +2205,7 @@ VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice device, const VkDescrip
 
 #if RESHADE_ADDON >= 2
 	reshade::vulkan::object_data<VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT> &data = *device_impl->register_object<VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT>(*pSetLayout);
+	data.create_flags = pCreateInfo->flags;
 	data.num_descriptors = 0;
 	data.push_descriptors = (pCreateInfo->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT) != 0;
 
@@ -2209,10 +2228,14 @@ VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice device, const VkDescrip
 
 			data.binding_to_offset.resize(std::max(data.binding_to_offset.size(), static_cast<size_t>(binding.binding) + 1));
 			data.binding_to_offset[binding.binding] = binding.descriptorCount;
+			data.binding_flags.resize(std::max(data.binding_flags.size(), static_cast<size_t>(binding.binding) + 1));
+			data.immutable_sampler_handles.resize(std::max(data.immutable_sampler_handles.size(), static_cast<size_t>(binding.binding) + 1));
 
 			if ((binding.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || binding.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) && binding.pImmutableSamplers != nullptr)
 			{
 				has_static_samplers = true;
+
+				data.immutable_sampler_handles[binding.binding].assign(binding.pImmutableSamplers, binding.pImmutableSamplers + binding.descriptorCount);
 
 				for (uint32_t k = 0; k < binding.descriptorCount; ++k)
 					data.static_samplers[i].push_back(reshade::vulkan::convert_sampler_desc(
@@ -2232,6 +2255,7 @@ VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice device, const VkDescrip
 			if (binding_flags_info != nullptr && i < binding_flags_info->bindingCount)
 			{
 				const VkDescriptorBindingFlags binding_flags = binding_flags_info->pBindingFlags[i];
+				data.binding_flags[binding.binding] = binding_flags;
 
 				if ((binding_flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0)
 					range.count = UINT32_MAX;

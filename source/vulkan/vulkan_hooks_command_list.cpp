@@ -1464,6 +1464,7 @@ bool should_use_dynamic_rendering(
 	return true;
 }
 
+
 const VkImageView *resolve_render_pass_attachments(
 	reshade::vulkan::device_impl *device_impl,
 	const VkRenderPassBeginInfo *begin_info)
@@ -1625,9 +1626,62 @@ void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRend
 				const uint32_t resolve_attachment = subpass.resolve_attachments[i];
 				if (resolve_attachment != VK_ATTACHMENT_UNUSED)
 				{
-					rt.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
-					rt.resolveImageView = attachments[resolve_attachment];
-					rt.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+					VkImageView resolve_view = attachments[resolve_attachment];
+					bool resolve_ok = (resolve_view != VK_NULL_HANDLE && rt.imageView != VK_NULL_HANDLE);
+
+					VkSampleCountFlagBits color_samples = VK_SAMPLE_COUNT_1_BIT;
+					VkSampleCountFlagBits resolve_samples = VK_SAMPLE_COUNT_1_BIT;
+					VkFormat color_format = VK_FORMAT_UNDEFINED;
+					VkFormat resolve_format = VK_FORMAT_UNDEFINED;
+
+					if (resolve_ok)
+					{
+						const auto view_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE_VIEW>(rt.imageView);
+						const auto resolve_view_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE_VIEW>(resolve_view);
+						if (view_data == nullptr || resolve_view_data == nullptr)
+						{
+							resolve_ok = false;
+						}
+						else
+						{
+							const auto image_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>(view_data->create_info.image);
+							const auto resolve_image_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>(resolve_view_data->create_info.image);
+							if (image_data == nullptr || resolve_image_data == nullptr)
+							{
+								resolve_ok = false;
+							}
+							else
+							{
+								color_samples = image_data->create_info.samples;
+								resolve_samples = resolve_image_data->create_info.samples;
+								color_format = view_data->create_info.format;
+								resolve_format = resolve_view_data->create_info.format;
+							}
+						}
+					}
+
+					if (resolve_ok)
+					{
+						if (color_samples == VK_SAMPLE_COUNT_1_BIT || resolve_samples != VK_SAMPLE_COUNT_1_BIT)
+							resolve_ok = false;
+						if (color_format != resolve_format)
+							resolve_ok = false;
+						if (reshade::vulkan::is_integer_format(color_format)) // TinyGlade doesn't need it
+							resolve_ok = false;
+					}
+
+					if (resolve_ok)
+					{
+						rt.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+						rt.resolveImageView = resolve_view;
+						rt.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+					}
+					else
+					{
+						rt.resolveMode = VK_RESOLVE_MODE_NONE;
+						rt.resolveImageView = VK_NULL_HANDLE;
+						rt.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+					}
 				}
 			}
 			else

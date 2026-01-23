@@ -208,6 +208,7 @@ namespace reshade::vulkan
 		uint32_t num_descriptors;
 		std::vector<api::descriptor_range> ranges;
 		std::vector<api::descriptor_range_with_static_samplers> ranges_with_static_samplers;
+		std::vector<std::vector<VkSampler>> immutable_sampler_handles;
 		std::vector<std::vector<api::sampler_desc>> static_samplers;
 		std::vector<uint32_t> binding_to_offset;
 		std::vector<VkDescriptorBindingFlags> binding_flags;
@@ -278,6 +279,54 @@ namespace reshade::vulkan
 		if (format >= VK_FORMAT_D16_UNORM_S8_UINT && format <= VK_FORMAT_D32_SFLOAT_S8_UINT)
 			return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
 		return VK_IMAGE_ASPECT_COLOR_BIT;
+	}
+
+	inline bool is_integer_format(VkFormat format)
+	{
+		switch (format)
+		{
+		case VK_FORMAT_R8_UINT:
+		case VK_FORMAT_R8_SINT:
+		case VK_FORMAT_R8G8_UINT:
+		case VK_FORMAT_R8G8_SINT:
+		case VK_FORMAT_R8G8B8_UINT:
+		case VK_FORMAT_R8G8B8_SINT:
+		case VK_FORMAT_B8G8R8_UINT:
+		case VK_FORMAT_B8G8R8_SINT:
+		case VK_FORMAT_R8G8B8A8_UINT:
+		case VK_FORMAT_R8G8B8A8_SINT:
+		case VK_FORMAT_B8G8R8A8_UINT:
+		case VK_FORMAT_B8G8R8A8_SINT:
+		case VK_FORMAT_A8B8G8R8_UINT_PACK32:
+		case VK_FORMAT_A8B8G8R8_SINT_PACK32:
+		case VK_FORMAT_A2R10G10B10_UINT_PACK32:
+		case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+		case VK_FORMAT_R16_UINT:
+		case VK_FORMAT_R16_SINT:
+		case VK_FORMAT_R16G16_UINT:
+		case VK_FORMAT_R16G16_SINT:
+		case VK_FORMAT_R16G16B16A16_UINT:
+		case VK_FORMAT_R16G16B16A16_SINT:
+		case VK_FORMAT_R32_UINT:
+		case VK_FORMAT_R32_SINT:
+		case VK_FORMAT_R32G32_UINT:
+		case VK_FORMAT_R32G32_SINT:
+		case VK_FORMAT_R32G32B32_UINT:
+		case VK_FORMAT_R32G32B32_SINT:
+		case VK_FORMAT_R32G32B32A32_UINT:
+		case VK_FORMAT_R32G32B32A32_SINT:
+		case VK_FORMAT_R64_UINT:
+		case VK_FORMAT_R64_SINT:
+		case VK_FORMAT_R64G64_UINT:
+		case VK_FORMAT_R64G64_SINT:
+		case VK_FORMAT_R64G64B64_UINT:
+		case VK_FORMAT_R64G64B64_SINT:
+		case VK_FORMAT_R64G64B64A64_UINT:
+		case VK_FORMAT_R64G64B64A64_SINT:
+			return true;
+		default:
+			return false;
+		}
 	}
 
 	inline void convert_subresource(uint32_t subresource, const VkImageCreateInfo &create_info, VkImageSubresourceLayers &subresource_info)

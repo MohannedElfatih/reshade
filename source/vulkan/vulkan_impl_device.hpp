@@ -32,6 +32,13 @@ namespace reshade::vulkan
 		friend class command_queue_impl;
 
 	public:
+		struct set_layout_flags_info
+		{
+			VkDescriptorSetLayoutCreateFlags create_flags = 0;
+			std::vector<VkDescriptorBindingFlags> binding_flags;
+			std::vector<std::vector<VkSampler>> immutable_sampler_handles;
+		};
+
 		device_impl(
 			VkDevice device,
 			VkPhysicalDevice physical_device,
@@ -75,6 +82,7 @@ namespace reshade::vulkan
 		void destroy_pipeline(api::pipeline pipeline) final;
 
 		bool create_pipeline_layout(uint32_t param_count, const api::pipeline_layout_param *params, api::pipeline_layout *out_layout) final;
+		bool create_pipeline_layout_with_flags(uint32_t param_count, const api::pipeline_layout_param *params, const std::vector<set_layout_flags_info> &set_layout_flags, api::pipeline_layout *out_layout);
 		void destroy_pipeline_layout(api::pipeline_layout layout) final;
 
 		void set_pending_set_layout_binding_flags(std::vector<std::vector<VkDescriptorBindingFlags>> &&flags);
@@ -205,6 +213,7 @@ namespace reshade::vulkan
 		bool _dynamic_rendering_local_read = false;
 
 	private:
+		bool create_pipeline_layout_internal(uint32_t param_count, const api::pipeline_layout_param *params, const std::vector<set_layout_flags_info> *set_layout_flags, api::pipeline_layout *out_layout);
 		bool create_shader_module(VkShaderStageFlagBits stage, const api::shader_desc &desc, VkPipelineShaderStageCreateInfo &stage_info, VkSpecializationInfo &spec_info, std::vector<VkSpecializationMapEntry> &spec_map);
 
 		VmaAllocator _alloc = nullptr;
