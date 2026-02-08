@@ -78,6 +78,52 @@ namespace reshade::vulkan
 		bool create_pipeline_layout(uint32_t param_count, const api::pipeline_layout_param *params, api::pipeline_layout *out_layout) final;
 		void destroy_pipeline_layout(api::pipeline_layout layout) final;
 
+		void set_pending_set_layout_binding_flags(std::vector<std::vector<VkDescriptorBindingFlags>> &&flags);
+		void clear_pending_set_layout_binding_flags();
+		std::vector<VkDescriptorBindingFlags> get_pending_set_layout_binding_flags(uint32_t set_index);
+		void set_pending_rendering_input_attachment_indices(uint32_t color_count, const uint32_t *color_input_indices, uint32_t depth_input_index, uint32_t stencil_input_index)
+		{
+			if (color_count > 8)
+				color_count = 8;
+
+			const std::unique_lock<std::shared_mutex> lock(_mutex);
+			_pending_rendering_input_attachment_indices.valid = true;
+			_pending_rendering_input_attachment_indices.color_count = color_count;
+			for (uint32_t i = 0; i < color_count; ++i)
+				_pending_rendering_input_attachment_indices.color_input_indices[i] = color_input_indices[i];
+			_pending_rendering_input_attachment_indices.depth_input_index = depth_input_index;
+			_pending_rendering_input_attachment_indices.stencil_input_index = stencil_input_index;
+		}
+		bool consume_pending_rendering_input_attachment_indices(uint32_t &out_color_count, uint32_t *out_color_input_indices, uint32_t &out_depth_input_index, uint32_t &out_stencil_input_index)
+		{
+			const std::unique_lock<std::shared_mutex> lock(_mutex);
+			if (!_pending_rendering_input_attachment_indices.valid)
+				return false;
+
+			out_color_count = _pending_rendering_input_attachment_indices.color_count;
+			for (uint32_t i = 0; i < out_color_count; ++i)
+				out_color_input_indices[i] = _pending_rendering_input_attachment_indices.color_input_indices[i];
+			out_depth_input_index = _pending_rendering_input_attachment_indices.depth_input_index;
+			out_stencil_input_index = _pending_rendering_input_attachment_indices.stencil_input_index;
+			_pending_rendering_input_attachment_indices.valid = false;
+			return true;
+		}
+		void set_pending_set_layouts(std::vector<VkDescriptorSetLayout> layouts)
+		{
+			const std::unique_lock<std::shared_mutex> lock(_mutex);
+			_pending_set_layouts = std::move(layouts);
+		}
+		void clear_pending_set_layouts()
+		{
+			const std::unique_lock<std::shared_mutex> lock(_mutex);
+			_pending_set_layouts.clear();
+		}
+		std::vector<VkDescriptorSetLayout> get_pending_set_layouts() const
+		{
+			const std::shared_lock<std::shared_mutex> lock(_mutex);
+			return _pending_set_layouts;
+		}
+
 		bool allocate_descriptor_tables(uint32_t count, api::pipeline_layout layout, uint32_t layout_param, api::descriptor_table *out_tables) final;
 		void free_descriptor_tables(uint32_t count, const api::descriptor_table *tables) final;
 
@@ -155,6 +201,7 @@ namespace reshade::vulkan
 
 		const GladVulkanContext _dispatch_table;
 		const VkPhysicalDeviceFeatures _enabled_features;
+		bool _dynamic_rendering_local_read = false;
 
 	private:
 		bool create_shader_module(VkShaderStageFlagBits stage, const api::shader_desc &desc, VkPipelineShaderStageCreateInfo &stage_info, VkSpecializationInfo &spec_info, std::vector<VkSpecializationMapEntry> &spec_map);
@@ -163,7 +210,17 @@ namespace reshade::vulkan
 		VkDescriptorPool _descriptor_pool = VK_NULL_HANDLE;
 		VkPrivateDataSlot _private_data_slot = VK_NULL_HANDLE;
 
-		std::shared_mutex _mutex;
+		mutable std::shared_mutex _mutex;
 		std::unordered_map<size_t, VkRenderPassBeginInfo> _render_pass_lookup;
+		std::vector<std::vector<VkDescriptorBindingFlags>> _pending_set_layout_binding_flags;
+		std::vector<VkDescriptorSetLayout> _pending_set_layouts;
+		struct pending_rendering_input_attachment_indices
+		{
+			bool valid = false;
+			uint32_t color_count = 0;
+			uint32_t color_input_indices[8] = {};
+			uint32_t depth_input_index = VK_ATTACHMENT_UNUSED;
+			uint32_t stencil_input_index = VK_ATTACHMENT_UNUSED;
+		} _pending_rendering_input_attachment_indices;
 	};
 }

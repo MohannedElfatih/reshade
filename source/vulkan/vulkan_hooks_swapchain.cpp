@@ -24,6 +24,36 @@ extern void create_default_view(reshade::vulkan::device_impl *device_impl, VkIma
 extern void destroy_default_view(reshade::vulkan::device_impl *device_impl, VkImage image);
 #endif
 
+
+template <typename T>
+static void modify_image_format_list_create_info(T& create_info, VkFormat image_format)
+{
+	thread_local std::vector<VkFormat> format_list;
+	// Use thread_local for the struct so the memory remains valid after function return
+	thread_local VkImageFormatListCreateInfoKHR format_list_info_storage;
+
+	format_list.clear();
+	format_list.push_back(reshade::vulkan::convert_format(
+		reshade::api::format_to_default_typed(reshade::vulkan::convert_format(image_format), 0)));
+
+	if (const auto existing_info = find_in_structure_chain<VkImageFormatListCreateInfoKHR>(
+		create_info.pNext, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR))
+	{
+		auto* mutable_info = const_cast<VkImageFormatListCreateInfoKHR*>(existing_info);
+		mutable_info->viewFormatCount = static_cast<uint32_t>(format_list.size());
+		mutable_info->pViewFormats = format_list.data();
+	}
+	else
+	{
+		format_list_info_storage = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR };
+		format_list_info_storage.pNext = create_info.pNext;
+		format_list_info_storage.viewFormatCount = static_cast<uint32_t>(format_list.size());
+		format_list_info_storage.pViewFormats = format_list.data();
+
+		create_info.pNext = &format_list_info_storage;
+	}
+}
+
 #if VK_KHR_swapchain
 VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain)
 {
@@ -195,6 +225,22 @@ VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreat
 	desc.back_buffer.heap = reshade::api::memory_heap::default_;
 	reshade::vulkan::convert_image_usage_flags_to_usage(create_info.imageUsage, desc.back_buffer.usage);
 
+	// modify_image_format_list_create_info(create_info, create_info.imageFormat);
+
+	// TODO(Ritsu): find another way to do this from addon
+	switch (create_info.imageFormat)
+	{
+	case VK_FORMAT_R16G16B16A16_SFLOAT:
+		create_info.imageColorSpace = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
+		break;
+	case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+	case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+		create_info.imageColorSpace = VK_COLOR_SPACE_HDR10_ST2084_EXT;
+		break;
+	default:
+		break;
+	}
+
 	desc.back_buffer_count = create_info.minImageCount;
 	desc.present_mode = static_cast<uint32_t>(create_info.presentMode);
 	desc.present_flags = create_info.flags;
@@ -224,7 +270,7 @@ VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreat
 		create_info.imageExtent.height = desc.back_buffer.texture.height;
 		create_info.imageArrayLayers = desc.back_buffer.texture.depth_or_layers;
 		reshade::vulkan::convert_usage_to_image_usage_flags(desc.back_buffer.usage, create_info.imageUsage);
-
+		modify_image_format_list_create_info(create_info, create_info.imageFormat);
 		create_info.minImageCount = desc.back_buffer_count;
 		create_info.presentMode = static_cast<VkPresentModeKHR>(desc.present_mode);
 		create_info.flags = static_cast<uint32_t>(desc.present_flags);
