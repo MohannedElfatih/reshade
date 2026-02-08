@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <vector>
+
 namespace reshade::vulkan
 {
 	class device_impl;
@@ -17,6 +19,8 @@ namespace reshade::vulkan
 		command_list_impl(device_impl *device, VkCommandBuffer cmd_buffer);
 
 		api::device *get_device() final;
+
+		void clear_general_layout_images() { _general_layout_images.clear(); }
 
 		void barrier(uint32_t count, const api::resource *resources, const api::resource_usage *old_states, const api::resource_usage *new_states) final;
 
@@ -77,6 +81,9 @@ namespace reshade::vulkan
 		device_impl *const _device_impl;
 		bool _has_commands = false;
 		bool _is_in_render_pass = false;
+		VkPipeline _current_graphics_pipeline = VK_NULL_HANDLE;
+		std::vector<VkDynamicState> _current_dynamic_states;
+		std::vector<VkImage> _general_layout_images;
 	};
 
 	template <>
@@ -95,6 +102,17 @@ namespace reshade::vulkan
 		VkFramebuffer current_framebuffer = VK_NULL_HANDLE;
 		VkImageView current_color_attachments[8] = {};
 		VkImageView current_depth_stencil_attachment = VK_NULL_HANDLE;
+		uint32_t current_color_attachment_count = 0;
+		VkFormat current_color_attachment_formats[8] = {};
+		VkFormat current_depth_attachment_format = VK_FORMAT_UNDEFINED;
+		VkFormat current_stencil_attachment_format = VK_FORMAT_UNDEFINED;
+		bool using_dynamic_rendering = false;
+		bool alpha_to_coverage_set = false;
+		bool alpha_to_one_set = false;
+		bool rasterizer_discard_set = false;
+		VkPipeline bound_graphics_pipeline = VK_NULL_HANDLE;
+		std::vector<VkDynamicState> bound_dynamic_states;
+		bool bound_dynamic_states_known = false;
 #endif
 	};
 }

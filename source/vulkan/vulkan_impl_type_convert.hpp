@@ -9,7 +9,10 @@
 #include "reshade_api_pipeline.hpp"
 #include <vector>
 #include <unordered_map>
+#include <mutex>
+#include <memory>
 #include <limits>
+#include <string>
 
 #ifndef AMD_VULKAN_MEMORY_ALLOCATOR_H
 using VmaAllocation = void *;
@@ -98,7 +101,10 @@ namespace reshade::vulkan
 		struct subpass
 		{
 			uint32_t color_attachments[8];
+			uint32_t resolve_attachments[8];
 			uint32_t num_color_attachments;
+			uint32_t input_attachments[8];
+			uint32_t num_input_attachments;
 			uint32_t depth_stencil_attachment;
 		};
 
@@ -120,7 +126,77 @@ namespace reshade::vulkan
 		using Handle = VkPipelineLayout;
 
 		std::vector<VkDescriptorSetLayout> set_layouts;
+		std::vector<VkDescriptorSetLayout> owned_set_layouts;
+		bool owns_set_layouts = false;
 		std::vector<VkSampler> embedded_samplers;
+	};
+
+	template <>
+	struct object_data<VK_OBJECT_TYPE_PIPELINE>
+	{
+		using Handle = VkPipeline;
+
+		// Rendering compatibility signature (extracted from render pass or dynamic info)
+		struct rendering_signature
+		{
+			uint32_t color_count = 0;
+			VkFormat color_formats[8] = {};
+			VkFormat depth_format = VK_FORMAT_UNDEFINED;
+			VkFormat stencil_format = VK_FORMAT_UNDEFINED;
+			VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+		};
+
+		// Filled at vkCreateGraphicsPipelines time
+		rendering_signature signature = {};
+
+		// Optional: cached dynamic-rendering clone
+		std::vector<rendering_signature> dynamic_rendering_signatures;
+		std::vector<VkPipeline> dynamic_rendering_pipelines;
+		std::unique_ptr<std::mutex> dynamic_rendering_mutex = std::make_unique<std::mutex>();
+
+		// --- NEW: capture enough to recreate the pipeline ---
+		bool is_graphics = false;
+
+		VkGraphicsPipelineCreateInfo captured_ci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+
+		// Owned backing storage for pointer fields
+		std::vector<VkPipelineShaderStageCreateInfo> stages;
+
+		VkPipelineVertexInputStateCreateInfo vertex_input = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+		std::vector<VkVertexInputBindingDescription> vi_bindings;
+		std::vector<VkVertexInputAttributeDescription> vi_attribs;
+
+		VkPipelineInputAssemblyStateCreateInfo input_assembly = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+		VkPipelineTessellationStateCreateInfo tessellation = { VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO };
+
+		VkPipelineViewportStateCreateInfo viewport = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+
+		VkPipelineRasterizationStateCreateInfo raster = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+		VkPipelineMultisampleStateCreateInfo msaa = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+		VkPipelineDepthStencilStateCreateInfo depth_stencil = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+
+		VkPipelineColorBlendStateCreateInfo blend = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+		std::vector<VkPipelineColorBlendAttachmentState> blend_attachments;
+
+		VkPipelineDynamicStateCreateInfo dynamic = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+		std::vector<VkDynamicState> dynamic_states;
+
+		struct owned_stage
+		{
+			VkPipelineShaderStageCreateInfo ci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+
+			// Owned storage for pointer fields
+			std::string entry_name;
+			std::vector<VkSpecializationMapEntry> spec_entries;
+			std::vector<uint8_t> spec_data;
+			VkSpecializationInfo spec_info = {};
+		};
+		std::vector<owned_stage> owned_stages;
+
+		// NOTE:
+		// We intentionally do NOT capture pNext chains for the state structs.
+		// If you need specific extensions (e.g. conservative raster, line raster, vertex divisor, etc.),
+		// we can selectively deep-copy those later.
 	};
 
 	template <>
@@ -128,11 +204,13 @@ namespace reshade::vulkan
 	{
 		using Handle = VkDescriptorSetLayout;
 
+		VkDescriptorSetLayoutCreateFlags create_flags = 0;
 		uint32_t num_descriptors;
 		std::vector<api::descriptor_range> ranges;
 		std::vector<api::descriptor_range_with_static_samplers> ranges_with_static_samplers;
 		std::vector<std::vector<api::sampler_desc>> static_samplers;
 		std::vector<uint32_t> binding_to_offset;
+		std::vector<VkDescriptorBindingFlags> binding_flags;
 		bool push_descriptors;
 	};
 
