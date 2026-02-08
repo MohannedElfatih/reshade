@@ -1561,6 +1561,11 @@ void reshade::vulkan::convert_dynamic_states(uint32_t count, const api::dynamic_
 {
 	internal_states.reserve(count);
 
+	const auto push_unique = [&internal_states](VkDynamicState state) {
+		if (std::find(internal_states.begin(), internal_states.end(), state) == internal_states.end())
+			internal_states.push_back(state);
+	};
+
 	for (uint32_t i = 0; i < count; ++i)
 	{
 		switch (states[i])
@@ -1568,69 +1573,69 @@ void reshade::vulkan::convert_dynamic_states(uint32_t count, const api::dynamic_
 		case api::dynamic_state::depth_bias:
 		case api::dynamic_state::depth_bias_clamp:
 		case api::dynamic_state::depth_bias_slope_scaled:
-			internal_states.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
+			push_unique(VK_DYNAMIC_STATE_DEPTH_BIAS);
 			break;
 		case api::dynamic_state::blend_constant:
-			internal_states.push_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
+			push_unique(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
 			break;
 		case api::dynamic_state::front_stencil_read_mask:
 		case api::dynamic_state::back_stencil_read_mask:
-			internal_states.push_back(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK);
+			push_unique(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK);
 			break;
 		case api::dynamic_state::front_stencil_write_mask:
 		case api::dynamic_state::back_stencil_write_mask:
-			internal_states.push_back(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK);
+			push_unique(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK);
 			break;
 		case api::dynamic_state::front_stencil_reference_value:
 		case api::dynamic_state::back_stencil_reference_value:
-			internal_states.push_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
+			push_unique(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
 			break;
 		case api::dynamic_state::cull_mode:
-			internal_states.push_back(VK_DYNAMIC_STATE_CULL_MODE);
+			push_unique(VK_DYNAMIC_STATE_CULL_MODE);
 			break;
 		case api::dynamic_state::front_counter_clockwise:
-			internal_states.push_back(VK_DYNAMIC_STATE_FRONT_FACE);
+			push_unique(VK_DYNAMIC_STATE_FRONT_FACE);
 			break;
 		case api::dynamic_state::primitive_topology:
-			internal_states.push_back(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY);
+			push_unique(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY);
 			break;
 		case api::dynamic_state::depth_enable:
-			internal_states.push_back(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE);
+			push_unique(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE);
 			break;
 		case api::dynamic_state::depth_write_mask:
-			internal_states.push_back(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE);
+			push_unique(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE);
 			break;
 		case api::dynamic_state::depth_func:
-			internal_states.push_back(VK_DYNAMIC_STATE_DEPTH_COMPARE_OP);
+			push_unique(VK_DYNAMIC_STATE_DEPTH_COMPARE_OP);
 			break;
 		case api::dynamic_state::stencil_enable:
-			internal_states.push_back(VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE);
+			push_unique(VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE);
 			break;
 		case api::dynamic_state::front_stencil_func:
 		case api::dynamic_state::back_stencil_func:
-			internal_states.push_back(VK_DYNAMIC_STATE_STENCIL_OP);
+			push_unique(VK_DYNAMIC_STATE_STENCIL_OP);
 			break;
 #if VK_EXT_extended_dynamic_state2
 		case api::dynamic_state::logic_op:
-			internal_states.push_back(VK_DYNAMIC_STATE_LOGIC_OP_EXT);
+			push_unique(VK_DYNAMIC_STATE_LOGIC_OP_EXT);
 			break;
 		case api::dynamic_state::fill_mode:
-			internal_states.push_back(VK_DYNAMIC_STATE_POLYGON_MODE_EXT);
+			push_unique(VK_DYNAMIC_STATE_POLYGON_MODE_EXT);
 			break;
 		case api::dynamic_state::multisample_enable:
-			internal_states.push_back(VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT);
+			push_unique(VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT);
 			break;
 		case api::dynamic_state::sample_mask:
-			internal_states.push_back(VK_DYNAMIC_STATE_SAMPLE_MASK_EXT);
+			push_unique(VK_DYNAMIC_STATE_SAMPLE_MASK_EXT);
 			break;
 		case api::dynamic_state::alpha_to_coverage_enable:
-			internal_states.push_back(VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT);
+			push_unique(VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT);
 			break;
 		case api::dynamic_state::logic_op_enable:
-			internal_states.push_back(VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT);
+			push_unique(VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT);
 			break;
 		case api::dynamic_state::blend_enable:
-			internal_states.push_back(VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT);
+			push_unique(VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT);
 			break;
 		case api::dynamic_state::source_color_blend_factor:
 		case api::dynamic_state::dest_color_blend_factor:
@@ -1638,18 +1643,18 @@ void reshade::vulkan::convert_dynamic_states(uint32_t count, const api::dynamic_
 		case api::dynamic_state::source_alpha_blend_factor:
 		case api::dynamic_state::dest_alpha_blend_factor:
 		case api::dynamic_state::alpha_blend_op:
-			internal_states.push_back(VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT);
+			push_unique(VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT);
 			break;
 		case api::dynamic_state::render_target_write_mask:
-			internal_states.push_back(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT);
+			push_unique(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT);
 			break;
 		case api::dynamic_state::depth_clip_enable:
-			internal_states.push_back(VK_DYNAMIC_STATE_DEPTH_CLIP_ENABLE_EXT);
+			push_unique(VK_DYNAMIC_STATE_DEPTH_CLIP_ENABLE_EXT);
 			break;
 #endif
 #if VK_KHR_ray_tracing_pipeline
 		case api::dynamic_state::ray_tracing_pipeline_stack_size:
-			internal_states.push_back(VK_DYNAMIC_STATE_RAY_TRACING_PIPELINE_STACK_SIZE_KHR);
+			push_unique(VK_DYNAMIC_STATE_RAY_TRACING_PIPELINE_STACK_SIZE_KHR);
 			break;
 #endif
 		default:
