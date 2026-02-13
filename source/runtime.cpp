@@ -37,6 +37,23 @@
 #include <stb_image_write.h>
 #include <stb_image_write_hdr_png.h>
 #include <stb_image_resize2.h>
+#if _WIN32
+#include <Windows.h>
+#endif
+
+static bool is_streamline_dlssg_active_runtime()
+{
+#if _WIN32
+	if (GetModuleHandleW(L"sl.interposer.dll") == nullptr)
+		return false;
+
+	return
+		GetModuleHandleW(L"sl.dlss_g.dll") != nullptr ||
+		GetModuleHandleW(L"nvngx_dlssg.dll") != nullptr;
+#else
+	return false;
+#endif
+}
 
 bool resolve_path(std::filesystem::path &path, std::error_code &ec)
 {
@@ -257,6 +274,13 @@ reshade::runtime::~runtime()
 bool reshade::runtime::on_init()
 {
 	assert(!_is_initialized);
+	log::message(log::level::debug,
+		"Runtime on_init begin: runtime=%p api=%d swapchain=%p hwnd=%p config='%s'.",
+		this,
+		static_cast<int>(_device->get_api()),
+		_swapchain,
+		get_hwnd(),
+		_config_path.u8string().c_str());
 
 	const api::resource_desc back_buffer_desc = _device->get_resource_desc(_swapchain->get_back_buffer(0));
 
@@ -441,6 +465,7 @@ bool reshade::runtime::on_init()
 
 	{
 		const input::window_handle window = get_hwnd();
+		input::set_streamline_fg_overlay_capture(false);
 		if (window != nullptr && !_is_vr)
 		{
 			_input = input::register_window(window);
@@ -521,6 +546,14 @@ exit_failure:
 }
 void reshade::runtime::on_reset()
 {
+	input::set_streamline_fg_overlay_capture(false);
+	log::message(log::level::debug,
+		"Runtime on_reset begin: runtime=%p initialized=%s frame_count=%llu hwnd=%p.",
+		this,
+		_is_initialized ? "true" : "false",
+		static_cast<unsigned long long>(_frame_count),
+		get_hwnd());
+
 	if (_is_initialized)
 		// Update initialization state immediately, so that any effect loading still in progress can abort early
 		_is_initialized = false;
@@ -593,7 +626,6 @@ void reshade::runtime::on_present()
 #endif
 
 	api::command_list *const cmd_list = _graphics_queue->get_immediate_command_list();
-
 	capture_state(cmd_list, _app_state);
 
 	uint32_t back_buffer_index = (_back_buffer_resolved != 0 ? 2 : 0) + _swapchain->get_current_back_buffer_index() * 2;
@@ -616,10 +648,9 @@ void reshade::runtime::on_present()
 		}
 	}
 
-	// Lock input so it cannot be modified by other threads while we are reading it here
-	std::unique_lock<std::recursive_mutex> input_lock;
-	if (_input != nullptr)
-		input_lock = _input->lock();
+	const bool streamline_fg_active = _device->get_api() == api::device_api::vulkan && is_streamline_dlssg_active_runtime();
+	bool skip_shortcuts = false;
+	bool skip_input_advance = false;
 
 	update_effects();
 
@@ -649,6 +680,37 @@ void reshade::runtime::on_present()
 	const auto current_time = std::chrono::high_resolution_clock::now();
 	_last_frame_duration = current_time - _last_present_time; _last_present_time = current_time;
 
+	// Lock input only once it is actually needed. Holding this lock for too long can starve
+	// message processing when Streamline FG is presenting from multiple threads.
+	std::unique_lock<std::recursive_mutex> input_lock;
+	_can_use_input_for_gui = false;
+	if (_input != nullptr)
+	{
+		if (streamline_fg_active)
+		{
+			input_lock = _input->try_lock();
+			if (!input_lock.owns_lock())
+			{
+				skip_shortcuts = true;
+				skip_input_advance = true;
+
+				static bool s_logged_streamline_fg_input_lock_contention = false;
+				if (!s_logged_streamline_fg_input_lock_contention)
+				{
+					log::message(log::level::warning,
+						"Vulkan Streamline FG compatibility: skipping input-dependent runtime work this frame due to input lock contention.");
+					s_logged_streamline_fg_input_lock_contention = true;
+				}
+			}
+		}
+		else
+		{
+			input_lock = _input->lock();
+		}
+
+		_can_use_input_for_gui = input_lock.owns_lock();
+	}
+
 #if RESHADE_GUI
 	// Draw overlay
 	if (_is_vr)
@@ -666,7 +728,7 @@ void reshade::runtime::on_present()
 	_should_save_screenshot = false;
 
 	// Handle keyboard shortcuts
-	if (!_ignore_shortcuts && _input != nullptr)
+	if (!skip_shortcuts && !_ignore_shortcuts && _input != nullptr)
 	{
 		if (_input->is_key_pressed(_effects_key_data, _force_shortcut_modifiers))
 		{
@@ -834,9 +896,16 @@ void reshade::runtime::on_present()
 	_effects_rendered_this_frame = false;
 
 	// Update input status
-	if (_primary_input_handler && _input != nullptr)
-		_input->next_frame();
-	if (_primary_input_handler && _input_gamepad != nullptr)
+	if (!skip_input_advance && _primary_input_handler && _input != nullptr)
+	{
+		if (streamline_fg_active && !input_lock.owns_lock())
+			input_lock = _input->try_lock();
+
+		if (!streamline_fg_active || input_lock.owns_lock())
+			_input->next_frame();
+	}
+
+	if (!skip_input_advance && _primary_input_handler && _input_gamepad != nullptr)
 		_input_gamepad->next_frame();
 
 	// Save modified INI files
@@ -3698,13 +3767,23 @@ void reshade::runtime::render_effects(api::command_list *cmd_list, api::resource
 		return;
 
 	// Lock input so it cannot be modified by other threads while we are reading it here
+	const bool streamline_fg_active = _device->get_api() == api::device_api::vulkan && is_streamline_dlssg_active_runtime();
 	std::unique_lock<std::recursive_mutex> input_lock;
 	if (_input != nullptr
 #if RESHADE_ADDON
 		&& !_is_in_present_call
 #endif
 		)
-		input_lock = _input->lock();
+	{
+		if (streamline_fg_active)
+			input_lock = _input->try_lock();
+		else
+			input_lock = _input->lock();
+	}
+
+	bool can_use_effect_input = _input != nullptr;
+	if (streamline_fg_active)
+		can_use_effect_input = input_lock.owns_lock();
 
 	// Update special uniform variables
 	for (effect &effect : _effects)
@@ -3783,7 +3862,7 @@ void reshade::runtime::render_effects(api::command_list *cmd_list, api::resource
 				}
 				break;
 			case special_uniform::key:
-				if (_input != nullptr)
+				if (can_use_effect_input)
 				{
 					const int keycode = variable.annotation_as_int("keycode");
 					if (keycode <= 7 || keycode >= 256)
@@ -3804,15 +3883,15 @@ void reshade::runtime::render_effects(api::command_list *cmd_list, api::resource
 				}
 				break;
 			case special_uniform::mouse_point:
-				if (_input != nullptr)
+				if (can_use_effect_input)
 					set_uniform_value(variable, _input->mouse_position_x(), _input->mouse_position_y());
 				break;
 			case special_uniform::mouse_delta:
-				if (_input != nullptr)
+				if (can_use_effect_input)
 					set_uniform_value(variable, _input->mouse_movement_delta_x(), _input->mouse_movement_delta_y());
 				break;
 			case special_uniform::mouse_button:
-				if (_input != nullptr)
+				if (can_use_effect_input)
 				{
 					const int keycode = variable.annotation_as_int("keycode");
 					if (keycode < 0 || keycode >= 5)
@@ -3833,7 +3912,7 @@ void reshade::runtime::render_effects(api::command_list *cmd_list, api::resource
 				}
 				break;
 			case special_uniform::mouse_wheel:
-				if (_input != nullptr)
+				if (can_use_effect_input)
 				{
 					const float min = variable.annotation_as_float("min");
 					const float max = variable.annotation_as_float("max");

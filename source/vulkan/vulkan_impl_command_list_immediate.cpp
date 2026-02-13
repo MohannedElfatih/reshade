@@ -133,9 +133,17 @@ bool reshade::vulkan::command_list_immediate_impl::flush(VkSubmitInfo &semaphore
 	// Only reset fence before an actual submit which can signal it again
 	vk.ResetFences(_device_impl->_orig, 1, &_cmd_fences[_cmd_index]);
 
-	if (vk.QueueSubmit(_parent_queue, 1, &submit_info, _cmd_fences[_cmd_index]) != VK_SUCCESS)
+	const VkResult submit_result = vk.QueueSubmit(_parent_queue, 1, &submit_info, _cmd_fences[_cmd_index]);
+	if (submit_result != VK_SUCCESS)
 	{
 		log::message(log::level::error, "Failed to submit immediate command list!");
+		log::message(
+			log::level::error,
+			"Immediate command list vkQueueSubmit failed: result=%d queue=%p wait_count=%u signal_count=%u.",
+			static_cast<int>(submit_result),
+			_parent_queue,
+			static_cast<unsigned int>(submit_info.waitSemaphoreCount),
+			static_cast<unsigned int>(submit_info.signalSemaphoreCount));
 
 		// Have to reset the command buffer when submitting it was unsuccessful
 		vk.BeginCommandBuffer(_orig, &begin_info);

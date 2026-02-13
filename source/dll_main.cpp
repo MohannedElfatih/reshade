@@ -10,7 +10,9 @@
 #include "addon_manager.hpp"
 #include <Windows.h>
 #include <Psapi.h>
+#include <DbgHelp.h>
 #include <delayimp.h> // Delay-load helpers
+#include <atomic>
 
 // Export special symbol to identify modules as ReShade instances
 extern "C" __declspec(dllexport) const char *ReShadeVersion = VERSION_STRING_PRODUCT;
@@ -108,11 +110,134 @@ std::filesystem::path get_module_path(HMODULE module)
 
 #ifndef RESHADE_TEST_APPLICATION
 
-#ifndef NDEBUG
-#include <DbgHelp.h>
-
 static PVOID s_exception_handler_handle = nullptr;
+static bool s_dump_exceptions_enabled = false;
+static std::atomic<unsigned int> s_logged_exception_count = 0;
+static std::atomic<unsigned int> s_dump_index = 0;
+
+static bool should_ignore_exception_code(DWORD code)
+{
+	return
+		code == CONTROL_C_EXIT ||
+		code == 0x406D1388 /* SetThreadName */ ||
+		code == DBG_PRINTEXCEPTION_C ||
+		code == DBG_PRINTEXCEPTION_WIDE_C ||
+		code == STATUS_BREAKPOINT ||
+		code == 0xE0434352 /* CLR exception */ ||
+		code == 0xE06D7363 /* Visual C++ exception */ ||
+		((code ^ 0xE24C4A00) <= 0xFF); /* LuaJIT exception */
+}
+
+static void log_exception_stack_trace(PEXCEPTION_POINTERS ex)
+{
+	const DWORD code = ex->ExceptionRecord->ExceptionCode;
+	const void *const address = ex->ExceptionRecord->ExceptionAddress;
+	const unsigned int hit_index = s_logged_exception_count.fetch_add(1, std::memory_order_relaxed);
+
+	// Keep this bounded to avoid log flooding in case of recurring faults.
+	if (hit_index >= 32)
+		return;
+
+	reshade::log::message(
+		reshade::log::level::error,
+		"Unhandled exception #%u: code=%#lx address=%p thread=%lu.",
+		hit_index,
+		static_cast<unsigned long>(code),
+		address,
+		GetCurrentThreadId());
+
+#if defined(_M_X64)
+	if (ex->ContextRecord != nullptr)
+	{
+		reshade::log::message(
+			reshade::log::level::error,
+			"Context RIP=%p RSP=%p RBP=%p.",
+			reinterpret_cast<void *>(ex->ContextRecord->Rip),
+			reinterpret_cast<void *>(ex->ContextRecord->Rsp),
+			reinterpret_cast<void *>(ex->ContextRecord->Rbp));
+	}
+#elif defined(_M_IX86)
+	if (ex->ContextRecord != nullptr)
+	{
+		reshade::log::message(
+			reshade::log::level::error,
+			"Context EIP=%p ESP=%p EBP=%p.",
+			reinterpret_cast<void *>(ex->ContextRecord->Eip),
+			reinterpret_cast<void *>(ex->ContextRecord->Esp),
+			reinterpret_cast<void *>(ex->ContextRecord->Ebp));
+	}
 #endif
+
+	void *frames[32] = {};
+	const USHORT captured = CaptureStackBackTrace(0, static_cast<DWORD>(32), frames, nullptr);
+	reshade::log::message(reshade::log::level::error, "Crash stack trace (%u frames):", static_cast<unsigned int>(captured));
+
+	for (USHORT i = 0; i < captured; ++i)
+	{
+		HMODULE return_module = nullptr;
+		if (GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				reinterpret_cast<LPCWSTR>(frames[i]),
+				&return_module) &&
+			return_module != nullptr)
+		{
+			const std::filesystem::path module_path = get_module_path(return_module);
+			reshade::log::message(reshade::log::level::error, "  #%u %p (%s)", static_cast<unsigned int>(i), frames[i], module_path.filename().u8string().c_str());
+		}
+		else
+		{
+			reshade::log::message(reshade::log::level::error, "  #%u %p", static_cast<unsigned int>(i), frames[i]);
+		}
+	}
+}
+
+static void write_exception_minidump(PEXCEPTION_POINTERS ex)
+{
+	if (!s_dump_exceptions_enabled)
+		return;
+
+	const unsigned int dump_index = s_dump_index.fetch_add(1, std::memory_order_relaxed);
+	if (dump_index >= 100)
+		return;
+
+	const HMODULE dbghelp_module = GetModuleHandleW(L"dbghelp.dll");
+	if (dbghelp_module == nullptr)
+		return;
+
+	const auto dbghelp_write_dump = reinterpret_cast<BOOL(WINAPI *)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION)>(
+		GetProcAddress(dbghelp_module, "MiniDumpWriteDump"));
+	if (dbghelp_write_dump == nullptr)
+		return;
+
+	char dump_name[] = "exception_00.dmp";
+	dump_name[10] = '0' + static_cast<char>(dump_index / 10);
+	dump_name[11] = '0' + static_cast<char>(dump_index % 10);
+
+	const HANDLE file = CreateFileA(dump_name, GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+		return;
+
+	MINIDUMP_EXCEPTION_INFORMATION info;
+	info.ThreadId = GetCurrentThreadId();
+	info.ExceptionPointers = ex;
+	info.ClientPointers = TRUE;
+
+	if (!dbghelp_write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, MiniDumpNormal, &info, nullptr, nullptr))
+		reshade::log::message(reshade::log::level::error, "Failed to write minidump!");
+
+	CloseHandle(file);
+}
+
+static LONG CALLBACK vectored_exception_logger(PEXCEPTION_POINTERS ex)
+{
+	if (should_ignore_exception_code(ex->ExceptionRecord->ExceptionCode))
+		return EXCEPTION_CONTINUE_SEARCH;
+
+	log_exception_stack_trace(ex);
+	write_exception_minidump(ex);
+
+	return EXCEPTION_CONTINUE_SEARCH;
+}
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 {
@@ -225,60 +350,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 				}
 			}
 
-#ifndef NDEBUG
-			if (config.get("INSTALL", "DumpExceptions"))
+			s_dump_exceptions_enabled = config.get("INSTALL", "DumpExceptions");
+			if (s_dump_exceptions_enabled)
 			{
 				// Load debug helper library as soon as possible, so that it is later available when an exception is handled
 				CreateThread(nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(&LoadLibraryW), const_cast<LPVOID>(static_cast<LPCVOID>(L"dbghelp.dll")), 0, nullptr);
-
-				s_exception_handler_handle = AddVectoredExceptionHandler(1, [](PEXCEPTION_POINTERS ex) -> LONG {
-					// Ignore debugging and some common language exceptions
-					if (const DWORD code = ex->ExceptionRecord->ExceptionCode;
-						code == CONTROL_C_EXIT || code == 0x406D1388 /* SetThreadName */ ||
-						code == DBG_PRINTEXCEPTION_C || code == DBG_PRINTEXCEPTION_WIDE_C || code == STATUS_BREAKPOINT ||
-						code == 0xE0434352 /* CLR exception */ ||
-						code == 0xE06D7363 /* Visual C++ exception */ ||
-						((code ^ 0xE24C4A00) <= 0xFF) /* LuaJIT exception */)
-						goto continue_search;
-
-					// Create dump with exception information for the first 100 occurrences
-					if (static unsigned int dump_index = 0; dump_index < 100)
-					{
-						const auto dbghelp_module = GetModuleHandleW(L"dbghelp.dll");
-						if (dbghelp_module == nullptr)
-							goto continue_search;
-
-						const auto dbghelp_write_dump = reinterpret_cast<BOOL(WINAPI *)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION)>(
-							GetProcAddress(dbghelp_module, "MiniDumpWriteDump"));
-						if (dbghelp_write_dump == nullptr)
-							goto continue_search;
-
-						char dump_name[] = "exception_00.dmp";
-						dump_name[10] = '0' + static_cast<char>(dump_index / 10);
-						dump_name[11] = '0' + static_cast<char>(dump_index % 10);
-
-						const HANDLE file = CreateFileA(dump_name, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-						if (file == INVALID_HANDLE_VALUE)
-							goto continue_search;
-
-						MINIDUMP_EXCEPTION_INFORMATION info;
-						info.ThreadId = GetCurrentThreadId();
-						info.ExceptionPointers = ex;
-						info.ClientPointers = TRUE;
-
-						if (dbghelp_write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, MiniDumpNormal, &info, nullptr, nullptr))
-							dump_index++;
-						else
-							reshade::log::message(reshade::log::level::error, "Failed to write minidump!");
-
-						CloseHandle(file);
-					}
-
-				continue_search:
-					return EXCEPTION_CONTINUE_SEARCH;
-				});
 			}
-#endif
+
+			s_exception_handler_handle = AddVectoredExceptionHandler(1, vectored_exception_logger);
+			if (s_exception_handler_handle == nullptr)
+				reshade::log::message(reshade::log::level::warning, "Failed to install vectored exception handler.");
 
 			if (config.get("INSTALL", "PreventUnloading"))
 			{
@@ -409,10 +490,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 				CloseHandle(g_exit_event);
 			}
 
-#ifndef NDEBUG
 			if (s_exception_handler_handle != nullptr)
 				RemoveVectoredExceptionHandler(s_exception_handler_handle);
-#endif
 
 			reshade::log::message(reshade::log::level::info, "Finished exiting.");
 		}

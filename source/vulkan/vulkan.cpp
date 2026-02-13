@@ -194,17 +194,21 @@ PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char *p
 #endif
 
 #if VK_KHR_swapchain
-	RESHADE_VULKAN_HOOK_PROC(CreateSwapchainKHR);
-	RESHADE_VULKAN_HOOK_PROC(DestroySwapchainKHR);
-	RESHADE_VULKAN_HOOK_PROC(AcquireNextImageKHR);
-	RESHADE_VULKAN_HOOK_PROC(QueuePresentKHR);
-	RESHADE_VULKAN_HOOK_PROC(AcquireNextImage2KHR);
+		RESHADE_VULKAN_HOOK_PROC(CreateSwapchainKHR);
+		RESHADE_VULKAN_HOOK_PROC(DestroySwapchainKHR);
+		RESHADE_VULKAN_HOOK_PROC(AcquireNextImageKHR);
+		RESHADE_VULKAN_HOOK_PROC(QueuePresentKHR);
+		RESHADE_VULKAN_HOOK_PROC(AcquireNextImage2KHR);
+#endif
+
+#if VK_EXT_hdr_metadata
+		RESHADE_VULKAN_HOOK_PROC_OPTIONAL(SetHdrMetadataEXT, );
 #endif
 
 #if RESHADE_ADDON
 #if VK_KHR_dynamic_rendering
-	RESHADE_VULKAN_HOOK_PROC_OPTIONAL(CmdBeginRendering, KHR);
-	RESHADE_VULKAN_HOOK_PROC_OPTIONAL(CmdEndRendering, KHR);
+		RESHADE_VULKAN_HOOK_PROC_OPTIONAL(CmdBeginRendering, KHR);
+		RESHADE_VULKAN_HOOK_PROC_OPTIONAL(CmdEndRendering, KHR);
 #endif
 #endif
 

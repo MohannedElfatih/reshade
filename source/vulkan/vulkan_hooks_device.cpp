@@ -9,19 +9,1429 @@
 #include "vulkan_impl_swapchain.hpp"
 #include "vulkan_impl_type_convert.hpp"
 #include "dll_log.hpp"
-#ifdef RESHADE_TEST_APPLICATION
+#include "ini_file.hpp"
 #include "hook_manager.hpp"
-#endif
 #include "addon_manager.hpp"
 #include "lockfree_linear_map.hpp"
+#include <intrin.h>
 #include <cstring> // std::strcmp, std::strncmp
 #include <algorithm> // std::find_if, std::min
+#include <cctype> // std::tolower
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio> // std::snprintf
+#include <limits>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 // Set during Vulkan device creation and presentation, to avoid hooking internal D3D devices created e.g. by NVIDIA Ansel, Optimus or layered DXGI swapchain
 extern thread_local bool g_in_dxgi_runtime;
 
 extern lockfree_linear_map<void *, vulkan_instance, 16> g_vulkan_instances;
 lockfree_linear_map<void *, reshade::vulkan::device_impl *, 8> g_vulkan_devices;
+
+static bool is_streamline_resource_format_logging_enabled()
+{
+	static const bool enabled = []
+	{
+		bool value = false;
+		reshade::global_config().get("DEBUG", "LogStreamlineResourceFormats", value);
+		return value;
+	}();
+
+	return enabled;
+}
+
+static bool is_vulkan_image_origin_logging_enabled()
+{
+	static const bool enabled = []
+	{
+		bool value = false;
+		reshade::global_config().get("DEBUG", "LogVulkanImageOrigins", value);
+		if (!value)
+			reshade::global_config().get("DEBUG", "LogVulkanImageCreation", value);
+		return value;
+	}();
+
+	return enabled;
+}
+
+static bool get_caller_module_file_name(const void *caller_address, std::string &module_file_name)
+{
+	if (caller_address == nullptr)
+		return false;
+
+	HMODULE return_module = nullptr;
+	if (!GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(caller_address),
+			&return_module) ||
+		return_module == nullptr)
+		return false;
+
+	WCHAR module_path[MAX_PATH] = {};
+	if (GetModuleFileNameW(return_module, module_path, ARRAYSIZE(module_path)) == 0)
+		return false;
+
+	module_file_name = std::filesystem::path(module_path).filename().u8string();
+	return true;
+}
+
+static bool is_streamline_tag_logging_enabled()
+{
+	static const bool enabled = []
+	{
+		bool value = false;
+		reshade::global_config().get("DEBUG", "LogStreamlineResourceTags", value);
+		if (!value)
+			reshade::global_config().get("DEBUG", "LogStreamlineTagMappings", value);
+		if (!value)
+			reshade::global_config().get("DEBUG", "LogStreamlineResourceFormats", value);
+		return value;
+	}();
+
+	return enabled;
+}
+
+struct streamline_option_overrides
+{
+	int dlss_color_buffers_hdr = -1;
+	int dlssd_color_buffers_hdr = -1;
+	int nis_hdr_mode = -1;
+	int dlssg_color_buffer_format = -1;
+	int dlssg_mvec_buffer_format = -1;
+	int dlssg_depth_buffer_format = -1;
+	int dlssg_hudless_buffer_format = -1;
+	int dlssg_ui_buffer_format = -1;
+
+	bool has_any_override() const
+	{
+		return
+			dlss_color_buffers_hdr >= 0 ||
+			dlssd_color_buffers_hdr >= 0 ||
+			nis_hdr_mode >= 0 ||
+			dlssg_color_buffer_format >= 0 ||
+			dlssg_mvec_buffer_format >= 0 ||
+			dlssg_depth_buffer_format >= 0 ||
+			dlssg_hudless_buffer_format >= 0 ||
+			dlssg_ui_buffer_format >= 0;
+	}
+};
+
+static const streamline_option_overrides &get_streamline_option_overrides()
+{
+	static const streamline_option_overrides overrides = []
+	{
+		streamline_option_overrides value;
+		reshade::global_config().get("DEBUG", "OverrideStreamlineDLSSColorBuffersHDR", value.dlss_color_buffers_hdr);
+		reshade::global_config().get("DEBUG", "OverrideStreamlineDLSSDColorBuffersHDR", value.dlssd_color_buffers_hdr);
+		reshade::global_config().get("DEBUG", "OverrideStreamlineNISHDRMode", value.nis_hdr_mode);
+		reshade::global_config().get("DEBUG", "OverrideStreamlineDLSSGColorBufferFormat", value.dlssg_color_buffer_format);
+		reshade::global_config().get("DEBUG", "OverrideStreamlineDLSSGMVecBufferFormat", value.dlssg_mvec_buffer_format);
+		reshade::global_config().get("DEBUG", "OverrideStreamlineDLSSGDepthBufferFormat", value.dlssg_depth_buffer_format);
+		reshade::global_config().get("DEBUG", "OverrideStreamlineDLSSGHUDLessBufferFormat", value.dlssg_hudless_buffer_format);
+		reshade::global_config().get("DEBUG", "OverrideStreamlineDLSSGUIBufferFormat", value.dlssg_ui_buffer_format);
+		return value;
+	}();
+
+	return overrides;
+}
+
+static bool is_streamline_option_logging_enabled()
+{
+	static const bool enabled = []
+	{
+		bool value = false;
+		reshade::global_config().get("DEBUG", "LogStreamlineFeatureOptions", value);
+		if (!value)
+			reshade::global_config().get("DEBUG", "LogStreamlineOptions", value);
+		return value;
+	}();
+
+	return enabled;
+}
+
+static bool is_streamline_core_call_logging_enabled()
+{
+	static const bool enabled = []
+	{
+		bool value = false;
+		reshade::global_config().get("DEBUG", "LogStreamlineCoreCalls", value);
+		if (!value)
+			reshade::global_config().get("DEBUG", "LogStreamlineFeatureOptions", value);
+		if (!value)
+			reshade::global_config().get("DEBUG", "LogStreamlineOptions", value);
+		return value;
+	}();
+
+	return enabled;
+}
+
+static bool is_streamline_option_hooking_enabled()
+{
+	const streamline_option_overrides &overrides = get_streamline_option_overrides();
+	return is_streamline_option_logging_enabled() || is_streamline_core_call_logging_enabled() || overrides.has_any_override();
+}
+
+static const char *vk_format_to_string(VkFormat format)
+{
+	switch (format)
+	{
+	case VK_FORMAT_UNDEFINED: return "VK_FORMAT_UNDEFINED";
+	case VK_FORMAT_R8_UNORM: return "VK_FORMAT_R8_UNORM";
+	case VK_FORMAT_R8G8_UNORM: return "VK_FORMAT_R8G8_UNORM";
+	case VK_FORMAT_R8G8B8A8_UNORM: return "VK_FORMAT_R8G8B8A8_UNORM";
+	case VK_FORMAT_R8G8B8A8_SRGB: return "VK_FORMAT_R8G8B8A8_SRGB";
+	case VK_FORMAT_B8G8R8A8_UNORM: return "VK_FORMAT_B8G8R8A8_UNORM";
+	case VK_FORMAT_B8G8R8A8_SRGB: return "VK_FORMAT_B8G8R8A8_SRGB";
+	case VK_FORMAT_A2R10G10B10_UNORM_PACK32: return "VK_FORMAT_A2R10G10B10_UNORM_PACK32";
+	case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "VK_FORMAT_A2B10G10R10_UNORM_PACK32";
+	case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return "VK_FORMAT_B10G11R11_UFLOAT_PACK32";
+	case VK_FORMAT_R16_SFLOAT: return "VK_FORMAT_R16_SFLOAT";
+	case VK_FORMAT_R16G16_SFLOAT: return "VK_FORMAT_R16G16_SFLOAT";
+	case VK_FORMAT_R16G16B16A16_UNORM: return "VK_FORMAT_R16G16B16A16_UNORM";
+	case VK_FORMAT_R16G16B16A16_SFLOAT: return "VK_FORMAT_R16G16B16A16_SFLOAT";
+	case VK_FORMAT_R32_UINT: return "VK_FORMAT_R32_UINT";
+	case VK_FORMAT_R32G32_SFLOAT: return "VK_FORMAT_R32G32_SFLOAT";
+	case VK_FORMAT_R32G32B32A32_SFLOAT: return "VK_FORMAT_R32G32B32A32_SFLOAT";
+	case VK_FORMAT_D16_UNORM: return "VK_FORMAT_D16_UNORM";
+	case VK_FORMAT_D24_UNORM_S8_UINT: return "VK_FORMAT_D24_UNORM_S8_UINT";
+	case VK_FORMAT_D32_SFLOAT: return "VK_FORMAT_D32_SFLOAT";
+	case VK_FORMAT_D32_SFLOAT_S8_UINT: return "VK_FORMAT_D32_SFLOAT_S8_UINT";
+	default: return "VK_FORMAT_UNKNOWN";
+	}
+}
+
+static bool should_log_streamline_resource_for_caller(const void *caller_address, std::string &module_file_name)
+{
+	if (!is_streamline_resource_format_logging_enabled() || caller_address == nullptr)
+		return false;
+
+	if (!get_caller_module_file_name(caller_address, module_file_name))
+		return false;
+	std::string module_file_name_lower = module_file_name;
+	std::transform(module_file_name_lower.begin(), module_file_name_lower.end(), module_file_name_lower.begin(),
+		[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+	return
+		module_file_name_lower.rfind("sl.", 0) == 0 ||
+		module_file_name_lower.find("nvngx") != std::string::npos ||
+		module_file_name_lower.find("streamline") != std::string::npos;
+}
+
+static bool should_log_streamline_resource_once(std::string signature)
+{
+	static std::mutex s_mutex;
+	static std::unordered_set<std::string> s_logged_signatures;
+
+	const std::unique_lock<std::mutex> lock(s_mutex);
+	return s_logged_signatures.emplace(std::move(signature)).second;
+}
+
+static void log_streamline_image_creation(const void *caller_address, const VkImageCreateInfo &create_info, VkImage image)
+{
+	std::string module_file_name;
+	if (!should_log_streamline_resource_for_caller(caller_address, module_file_name))
+		return;
+
+	std::string signature = module_file_name + "|image|" +
+		std::to_string(static_cast<int>(create_info.format)) + "|" +
+		std::to_string(static_cast<unsigned int>(create_info.usage)) + "|" +
+		std::to_string(static_cast<unsigned int>(create_info.extent.width)) + "x" +
+		std::to_string(static_cast<unsigned int>(create_info.extent.height)) + "x" +
+		std::to_string(static_cast<unsigned int>(create_info.extent.depth)) + "|" +
+		std::to_string(static_cast<unsigned int>(create_info.mipLevels)) + "|" +
+		std::to_string(static_cast<unsigned int>(create_info.arrayLayers)) + "|" +
+		std::to_string(static_cast<unsigned int>(create_info.samples));
+	if (!should_log_streamline_resource_once(std::move(signature)))
+		return;
+
+	reshade::log::message(reshade::log::level::info,
+		"Vulkan Streamline resource image: module=%s image=%p format=%d(%s) usage=%#x extent=%ux%ux%u mips=%u layers=%u samples=%u tiling=%u flags=%#x initial_layout=%u.",
+		module_file_name.c_str(),
+		image,
+		static_cast<int>(create_info.format),
+		vk_format_to_string(create_info.format),
+		static_cast<unsigned int>(create_info.usage),
+		create_info.extent.width,
+		create_info.extent.height,
+		create_info.extent.depth,
+		create_info.mipLevels,
+		create_info.arrayLayers,
+		static_cast<unsigned int>(create_info.samples),
+		static_cast<unsigned int>(create_info.tiling),
+		static_cast<unsigned int>(create_info.flags),
+		static_cast<unsigned int>(create_info.initialLayout));
+}
+
+static void log_vulkan_image_creation_origin(const void *caller_address, const VkImageCreateInfo &create_info, VkImage image)
+{
+	if (!is_vulkan_image_origin_logging_enabled())
+		return;
+
+	std::string module_file_name = "unknown";
+	get_caller_module_file_name(caller_address, module_file_name);
+
+	reshade::log::message(reshade::log::level::info,
+		"Vulkan image origin: module=%s image=%p format=%d(%s) usage=%#x extent=%ux%ux%u mips=%u layers=%u samples=%u tiling=%u flags=%#x initial_layout=%u sharing_mode=%u.",
+		module_file_name.c_str(),
+		image,
+		static_cast<int>(create_info.format),
+		vk_format_to_string(create_info.format),
+		static_cast<unsigned int>(create_info.usage),
+		create_info.extent.width,
+		create_info.extent.height,
+		create_info.extent.depth,
+		create_info.mipLevels,
+		create_info.arrayLayers,
+		static_cast<unsigned int>(create_info.samples),
+		static_cast<unsigned int>(create_info.tiling),
+		static_cast<unsigned int>(create_info.flags),
+		static_cast<unsigned int>(create_info.initialLayout),
+		static_cast<unsigned int>(create_info.sharingMode));
+}
+
+static bool should_trace_vulkan_addon_image_upgrade(const void *caller_address, const VkImageCreateInfo &create_info, std::string &module_file_name)
+{
+	if (create_info.imageType != VK_IMAGE_TYPE_2D ||
+		create_info.format != VK_FORMAT_R8G8B8A8_UNORM ||
+		create_info.extent.width < 1920 ||
+		create_info.extent.height < 1080)
+		return false;
+
+	const VkImageUsageFlags required_usage_bits =
+		VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+		VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+		VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	if ((create_info.usage & required_usage_bits) == 0)
+		return false;
+
+	if (!get_caller_module_file_name(caller_address, module_file_name))
+		module_file_name = "unknown";
+
+	std::string module_file_name_lower = module_file_name;
+	std::transform(module_file_name_lower.begin(), module_file_name_lower.end(), module_file_name_lower.begin(),
+		[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+	if (
+		module_file_name_lower.rfind("sl.", 0) == 0 ||
+		module_file_name_lower.find("nvngx") != std::string::npos ||
+		module_file_name_lower.find("streamline") != std::string::npos)
+		return true;
+
+	// Handles anonymized vendor module names like "1B0_E658703.dll".
+	const size_t underscore_pos = module_file_name_lower.find('_');
+	const size_t dll_pos = module_file_name_lower.rfind(".dll");
+	if (underscore_pos == std::string::npos || dll_pos != module_file_name_lower.size() - 4 || underscore_pos == 0)
+		return false;
+
+	return std::all_of(
+		module_file_name_lower.begin(),
+		module_file_name_lower.begin() + static_cast<std::ptrdiff_t>(underscore_pos),
+		[](unsigned char c) { return std::isxdigit(c) != 0; });
+}
+
+static void log_streamline_image_view_creation(reshade::vulkan::device_impl *device_impl, const void *caller_address, const VkImageViewCreateInfo &create_info, VkImageView view)
+{
+	std::string module_file_name;
+	if (!should_log_streamline_resource_for_caller(caller_address, module_file_name))
+		return;
+
+	const auto image_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE, true>(create_info.image);
+	const VkFormat image_format = image_data != nullptr ? image_data->create_info.format : VK_FORMAT_UNDEFINED;
+	const VkImageUsageFlags image_usage = image_data != nullptr ? image_data->create_info.usage : 0;
+	const VkExtent3D image_extent = image_data != nullptr ? image_data->create_info.extent : VkExtent3D { 0, 0, 0 };
+
+	std::string signature = module_file_name + "|image_view|" +
+		std::to_string(static_cast<int>(create_info.format)) + "|" +
+		std::to_string(static_cast<unsigned int>(create_info.viewType)) + "|" +
+		std::to_string(static_cast<unsigned int>(create_info.subresourceRange.aspectMask)) + "|" +
+		std::to_string(static_cast<unsigned int>(create_info.subresourceRange.levelCount)) + "|" +
+		std::to_string(static_cast<unsigned int>(create_info.subresourceRange.layerCount)) + "|" +
+		std::to_string(static_cast<int>(image_format)) + "|" +
+		std::to_string(static_cast<unsigned int>(image_usage)) + "|" +
+		std::to_string(static_cast<unsigned int>(image_extent.width)) + "x" +
+		std::to_string(static_cast<unsigned int>(image_extent.height)) + "x" +
+		std::to_string(static_cast<unsigned int>(image_extent.depth));
+	if (!should_log_streamline_resource_once(std::move(signature)))
+		return;
+
+	reshade::log::message(reshade::log::level::info,
+		"Vulkan Streamline resource image view: module=%s view=%p image=%p view_format=%d(%s) image_format=%d(%s) image_usage=%#x view_type=%u aspect=%#x levels=%u layers=%u image_extent=%ux%ux%u.",
+		module_file_name.c_str(),
+		view,
+		create_info.image,
+		static_cast<int>(create_info.format),
+		vk_format_to_string(create_info.format),
+		static_cast<int>(image_format),
+		vk_format_to_string(image_format),
+		static_cast<unsigned int>(image_usage),
+		static_cast<unsigned int>(create_info.viewType),
+		static_cast<unsigned int>(create_info.subresourceRange.aspectMask),
+		create_info.subresourceRange.levelCount,
+		create_info.subresourceRange.layerCount,
+		image_extent.width,
+		image_extent.height,
+		image_extent.depth);
+}
+
+namespace streamline_abi
+{
+	struct struct_type
+	{
+		uint32_t data1;
+		uint16_t data2;
+		uint16_t data3;
+		uint8_t data4[8];
+	};
+
+	struct base_structure
+	{
+		base_structure *next;
+		struct_type type;
+		size_t struct_version;
+	};
+
+	using command_buffer = void;
+	using buffer_type = uint32_t;
+
+	enum boolean : int8_t
+	{
+		e_false = 0,
+		e_true = 1,
+		e_invalid = 2,
+	};
+
+	enum class resource_type : int8_t
+	{
+		e_tex2d = 0,
+		e_buffer = 1,
+		e_command_queue = 2,
+		e_command_buffer = 3,
+		e_command_pool = 4,
+		e_fence = 5,
+		e_swapchain = 6,
+		e_host_fence = 7,
+		e_unknown = 8,
+	};
+
+	enum resource_lifecycle : uint32_t
+	{
+		e_only_valid_now = 0,
+		e_valid_until_present = 1,
+		e_valid_until_evaluate = 2,
+	};
+
+	struct extent
+	{
+		base_structure base;
+		float left;
+		float top;
+		float width;
+		float height;
+	};
+
+	struct resource
+	{
+		base_structure base;
+		resource_type type;
+		uint8_t reserved0[alignof(void *) - sizeof(resource_type)];
+		void *native;
+		void *memory;
+		void *view;
+		uint32_t state;
+		uint32_t width;
+		uint32_t height;
+		uint32_t native_format;
+		uint32_t mip_levels;
+		uint32_t array_layers;
+		uint64_t gpu_virtual_address;
+		uint32_t flags;
+		uint32_t usage;
+		uint32_t reserved1;
+	};
+
+	struct resource_tag
+	{
+		base_structure base;
+		resource *resource;
+		buffer_type type;
+		resource_lifecycle lifecycle;
+		extent extent;
+	};
+
+	struct viewport_handle
+	{
+		base_structure base;
+		uint32_t value;
+	};
+
+	struct dlss_options
+	{
+		base_structure base;
+		uint32_t mode;
+		uint32_t output_width;
+		uint32_t output_height;
+		float sharpness;
+		float pre_exposure;
+		float exposure_scale;
+		boolean color_buffers_hdr;
+	};
+
+	struct dlssd_options
+	{
+		base_structure base;
+		uint32_t mode;
+		uint32_t output_width;
+		uint32_t output_height;
+		float sharpness;
+		float pre_exposure;
+		float exposure_scale;
+		boolean color_buffers_hdr;
+	};
+
+	struct dlssg_options
+	{
+		base_structure base;
+		uint32_t mode;
+		uint32_t num_frames_to_generate;
+		uint32_t flags;
+		uint32_t dynamic_res_width;
+		uint32_t dynamic_res_height;
+		uint32_t num_back_buffers;
+		uint32_t mvec_depth_width;
+		uint32_t mvec_depth_height;
+		uint32_t color_width;
+		uint32_t color_height;
+		uint32_t color_buffer_format;
+		uint32_t mvec_buffer_format;
+		uint32_t depth_buffer_format;
+		uint32_t hudless_buffer_format;
+		uint32_t ui_buffer_format;
+	};
+
+	struct nis_options
+	{
+		base_structure base;
+		uint32_t mode;
+		uint32_t hdr_mode;
+		float sharpness;
+	};
+}
+
+static_assert(offsetof(streamline_abi::resource_tag, resource) == sizeof(streamline_abi::base_structure));
+static_assert(offsetof(streamline_abi::resource, native) == sizeof(streamline_abi::base_structure) + alignof(void *));
+
+struct tracked_streamline_image_info
+{
+	VkFormat format = VK_FORMAT_UNDEFINED;
+	VkImageUsageFlags usage = 0;
+	VkExtent3D extent = { 0, 0, 0 };
+};
+
+using sl_set_tag_fn = int(const void *viewport, const streamline_abi::resource_tag *tags, uint32_t num_tags, streamline_abi::command_buffer *cmd_buffer);
+using sl_set_tag_for_frame_fn = int(const void *frame, const void *viewport, const streamline_abi::resource_tag *tags, uint32_t num_tags, streamline_abi::command_buffer *cmd_buffer);
+using sl_get_feature_function_fn = int(uint32_t feature, const char *function_name, void **function);
+using sl_dlss_set_options_fn = int(const void *viewport, const streamline_abi::dlss_options *options);
+using sl_dlssd_set_options_fn = int(const void *viewport, const streamline_abi::dlssd_options *options);
+using sl_dlssg_set_options_fn = int(const void *viewport, const streamline_abi::dlssg_options *options);
+using sl_nis_set_options_fn = int(const void *viewport, const streamline_abi::nis_options *options);
+using sl_set_constants_fn = int(const void *constants, const void *frame, const void *viewport);
+using sl_evaluate_feature_fn = int(uint32_t feature, const void *frame, const void *inputs, uint32_t num_inputs, streamline_abi::command_buffer *cmd_buffer);
+
+static std::mutex s_streamline_tag_image_mutex;
+static std::unordered_map<VkImage, tracked_streamline_image_info> s_streamline_tag_images;
+static std::mutex s_streamline_feature_hook_mutex;
+static std::unordered_set<void *> s_streamline_feature_hook_targets;
+
+static int HookStreamlineSetTag(const void *viewport, const streamline_abi::resource_tag *tags, uint32_t num_tags, streamline_abi::command_buffer *cmd_buffer);
+static int HookStreamlineSetTagForFrame(const void *frame, const void *viewport, const streamline_abi::resource_tag *tags, uint32_t num_tags, streamline_abi::command_buffer *cmd_buffer);
+static int HookStreamlineGetFeatureFunction(uint32_t feature, const char *function_name, void **function);
+static int HookStreamlineDLSSSetOptions(const void *viewport, const streamline_abi::dlss_options *options);
+static int HookStreamlineDLSSDSetOptions(const void *viewport, const streamline_abi::dlssd_options *options);
+static int HookStreamlineDLSSGSetOptions(const void *viewport, const streamline_abi::dlssg_options *options);
+static int HookStreamlineNISSetOptions(const void *viewport, const streamline_abi::nis_options *options);
+static int HookStreamlineSetConstants(const void *constants, const void *frame, const void *viewport);
+static int HookStreamlineEvaluateFeature(uint32_t feature, const void *frame, const void *inputs, uint32_t num_inputs, streamline_abi::command_buffer *cmd_buffer);
+static bool try_install_streamline_feature_option_hook(const char *function_name, void *function_ptr);
+static void try_install_streamline_tag_hooks();
+
+static void track_streamline_image_for_tags(VkImage image, const VkImageCreateInfo &create_info)
+{
+	if (!is_streamline_tag_logging_enabled() || image == VK_NULL_HANDLE)
+		return;
+
+	tracked_streamline_image_info info;
+	info.format = create_info.format;
+	info.usage = create_info.usage;
+	info.extent = create_info.extent;
+
+	const std::unique_lock<std::mutex> lock(s_streamline_tag_image_mutex);
+	s_streamline_tag_images[image] = info;
+}
+
+static void untrack_streamline_image_for_tags(VkImage image)
+{
+	if (!is_streamline_tag_logging_enabled() || image == VK_NULL_HANDLE)
+		return;
+
+	const std::unique_lock<std::mutex> lock(s_streamline_tag_image_mutex);
+	s_streamline_tag_images.erase(image);
+}
+
+static bool try_get_tracked_streamline_image(VkImage image, tracked_streamline_image_info &out_info)
+{
+	const std::unique_lock<std::mutex> lock(s_streamline_tag_image_mutex);
+	const auto it = s_streamline_tag_images.find(image);
+	if (it == s_streamline_tag_images.end())
+		return false;
+
+	out_info = it->second;
+	return true;
+}
+
+static const char *streamline_buffer_type_to_string(uint32_t buffer_type)
+{
+	switch (buffer_type)
+	{
+	case 0: return "kBufferTypeDepth";
+	case 1: return "kBufferTypeMotionVectors";
+	case 2: return "kBufferTypeHUDLessColor";
+	case 3: return "kBufferTypeScalingInputColor";
+	case 4: return "kBufferTypeScalingOutputColor";
+	case 23: return "kBufferTypeUIColorAndAlpha";
+	case 35: return "kBufferTypeOpaqueColor";
+	case 53: return "kBufferTypeBackbuffer";
+	default: return "kBufferTypeUnknown";
+	}
+}
+
+static const char *streamline_resource_type_to_string(int resource_type)
+{
+	switch (resource_type)
+	{
+	case 0: return "eTex2d";
+	case 1: return "eBuffer";
+	case 2: return "eCommandQueue";
+	case 3: return "eCommandBuffer";
+	case 4: return "eCommandPool";
+	case 5: return "eFence";
+	case 6: return "eSwapchain";
+	case 7: return "eHostFence";
+	case 8: return "eUnknown";
+	default: return "eInvalid";
+	}
+}
+
+static const char *streamline_resource_lifecycle_to_string(streamline_abi::resource_lifecycle lifecycle)
+{
+	switch (lifecycle)
+	{
+	case streamline_abi::e_only_valid_now: return "eOnlyValidNow";
+	case streamline_abi::e_valid_until_present: return "eValidUntilPresent";
+	case streamline_abi::e_valid_until_evaluate: return "eValidUntilEvaluate";
+	default: return "eUnknown";
+	}
+}
+
+static uint32_t get_streamline_viewport_value(const void *viewport)
+{
+	if (viewport == nullptr)
+		return std::numeric_limits<uint32_t>::max();
+
+	return static_cast<const streamline_abi::viewport_handle *>(viewport)->value;
+}
+
+static const char *streamline_feature_to_string(uint32_t feature)
+{
+	switch (feature)
+	{
+	case 0: return "kFeatureDLSS";
+	case 2: return "kFeatureNIS";
+	case 1000: return "kFeatureDLSS_G";
+	case 1001: return "kFeatureDLSS_RR";
+	default: return "kFeatureUnknown";
+	}
+}
+
+static const char *streamline_boolean_to_string(streamline_abi::boolean value)
+{
+	switch (value)
+	{
+	case streamline_abi::e_false: return "eFalse";
+	case streamline_abi::e_true: return "eTrue";
+	case streamline_abi::e_invalid: return "eInvalid";
+	default: return "eUnknown";
+	}
+}
+
+static const char *streamline_nis_hdr_mode_to_string(uint32_t mode)
+{
+	switch (mode)
+	{
+	case 0: return "eNone";
+	case 1: return "eLinear";
+	case 2: return "ePQ";
+	default: return "eUnknown";
+	}
+}
+
+static std::string streamline_struct_type_to_string(const streamline_abi::struct_type &type)
+{
+	char buffer[64] = {};
+	std::snprintf(
+		buffer,
+		sizeof(buffer),
+		"%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+		type.data1,
+		type.data2,
+		type.data3,
+		type.data4[0],
+		type.data4[1],
+		type.data4[2],
+		type.data4[3],
+		type.data4[4],
+		type.data4[5],
+		type.data4[6],
+		type.data4[7]);
+	return buffer;
+}
+
+static bool try_get_override_u32(int override_value, uint32_t &out_value)
+{
+	if (override_value < 0)
+		return false;
+
+	out_value = static_cast<uint32_t>(override_value);
+	return true;
+}
+
+static bool try_install_streamline_feature_option_hook(const char *function_name, void *function_ptr)
+{
+	if (!is_streamline_option_hooking_enabled() || function_name == nullptr || function_ptr == nullptr)
+		return false;
+
+	reshade::hook::address replacement = 0;
+
+	if (std::strcmp(function_name, "slDLSSSetOptions") == 0)
+		replacement = reinterpret_cast<reshade::hook::address>(&HookStreamlineDLSSSetOptions);
+	else if (std::strcmp(function_name, "slDLSSDSetOptions") == 0)
+		replacement = reinterpret_cast<reshade::hook::address>(&HookStreamlineDLSSDSetOptions);
+	else if (std::strcmp(function_name, "slDLSSGSetOptions") == 0)
+		replacement = reinterpret_cast<reshade::hook::address>(&HookStreamlineDLSSGSetOptions);
+	else if (std::strcmp(function_name, "slNISSetOptions") == 0)
+		replacement = reinterpret_cast<reshade::hook::address>(&HookStreamlineNISSetOptions);
+	else
+		return false;
+
+	{
+		const std::unique_lock<std::mutex> lock(s_streamline_feature_hook_mutex);
+		if (!s_streamline_feature_hook_targets.emplace(function_ptr).second)
+			return true;
+	}
+
+	if (!reshade::hooks::install(function_name, reinterpret_cast<reshade::hook::address>(function_ptr), replacement))
+	{
+		const std::unique_lock<std::mutex> lock(s_streamline_feature_hook_mutex);
+		s_streamline_feature_hook_targets.erase(function_ptr);
+		return false;
+	}
+
+	if (is_streamline_option_logging_enabled())
+	{
+		reshade::log::message(reshade::log::level::info,
+			"Installed Vulkan Streamline options hook: function=%s target=%p replacement=%p.",
+			function_name,
+			function_ptr,
+			reinterpret_cast<void *>(replacement));
+	}
+
+	return true;
+}
+
+static int HookStreamlineGetFeatureFunction(uint32_t feature, const char *function_name, void **function)
+{
+	static const auto trampoline = reshade::hooks::call<sl_get_feature_function_fn *>(&HookStreamlineGetFeatureFunction);
+	const int result = trampoline(feature, function_name, function);
+
+	void *resolved_function = nullptr;
+	if (function != nullptr)
+		resolved_function = *function;
+
+	if (resolved_function != nullptr)
+		(void)try_install_streamline_feature_option_hook(function_name, resolved_function);
+
+	if (is_streamline_option_logging_enabled())
+	{
+		std::string signature = std::string("streamline_get_feature_function|") +
+			std::to_string(feature) + "|" +
+			(function_name != nullptr ? function_name : "<null>") + "|" +
+			std::to_string(reinterpret_cast<uintptr_t>(resolved_function)) + "|" +
+			std::to_string(result);
+		if (should_log_streamline_resource_once(std::move(signature)))
+		{
+			reshade::log::message(reshade::log::level::info,
+				"Vulkan Streamline feature function: feature=%u(%s) name=%s function=%p result=%d.",
+				feature,
+				streamline_feature_to_string(feature),
+				function_name != nullptr ? function_name : "<null>",
+				resolved_function,
+				result);
+		}
+	}
+
+	return result;
+}
+
+static int HookStreamlineDLSSSetOptions(const void *viewport, const streamline_abi::dlss_options *options)
+{
+	const streamline_option_overrides &overrides = get_streamline_option_overrides();
+	streamline_abi::boolean restore_color_buffers_hdr = streamline_abi::e_invalid;
+	bool restore_needed = false;
+
+	if (options != nullptr &&
+		(overrides.dlss_color_buffers_hdr == 0 || overrides.dlss_color_buffers_hdr == 1))
+	{
+		streamline_abi::dlss_options *const mutable_options = const_cast<streamline_abi::dlss_options *>(options);
+		const streamline_abi::boolean override_value = overrides.dlss_color_buffers_hdr != 0 ? streamline_abi::e_true : streamline_abi::e_false;
+		if (mutable_options->color_buffers_hdr != override_value)
+		{
+			restore_color_buffers_hdr = mutable_options->color_buffers_hdr;
+			mutable_options->color_buffers_hdr = override_value;
+			restore_needed = true;
+		}
+	}
+
+	if (is_streamline_option_logging_enabled() && options != nullptr)
+	{
+		std::string signature = std::string("streamline_dlss_set_options|") +
+			std::to_string(get_streamline_viewport_value(viewport)) + "|" +
+			std::to_string(options->mode) + "|" +
+			std::to_string(options->output_width) + "|" +
+			std::to_string(options->output_height) + "|" +
+			std::to_string(static_cast<int>(options->color_buffers_hdr));
+		const bool should_log = should_log_streamline_resource_once(std::move(signature)) || restore_needed;
+		if (should_log)
+		{
+			reshade::log::message(reshade::log::level::info,
+				"Vulkan Streamline options: api=slDLSSSetOptions viewport=%u mode=%u output=%ux%u colorBuffersHDR=%d(%s)%s.",
+				get_streamline_viewport_value(viewport),
+				options->mode,
+				options->output_width,
+				options->output_height,
+				static_cast<int>(options->color_buffers_hdr),
+				streamline_boolean_to_string(options->color_buffers_hdr),
+				restore_needed ? " [override applied]" : "");
+		}
+	}
+
+	static const auto trampoline = reshade::hooks::call<sl_dlss_set_options_fn *>(&HookStreamlineDLSSSetOptions);
+	const int result = trampoline(viewport, options);
+
+	if (restore_needed)
+		const_cast<streamline_abi::dlss_options *>(options)->color_buffers_hdr = restore_color_buffers_hdr;
+
+	return result;
+}
+
+static int HookStreamlineDLSSDSetOptions(const void *viewport, const streamline_abi::dlssd_options *options)
+{
+	const streamline_option_overrides &overrides = get_streamline_option_overrides();
+	streamline_abi::boolean restore_color_buffers_hdr = streamline_abi::e_invalid;
+	bool restore_needed = false;
+
+	if (options != nullptr &&
+		(overrides.dlssd_color_buffers_hdr == 0 || overrides.dlssd_color_buffers_hdr == 1))
+	{
+		streamline_abi::dlssd_options *const mutable_options = const_cast<streamline_abi::dlssd_options *>(options);
+		const streamline_abi::boolean override_value = overrides.dlssd_color_buffers_hdr != 0 ? streamline_abi::e_true : streamline_abi::e_false;
+		if (mutable_options->color_buffers_hdr != override_value)
+		{
+			restore_color_buffers_hdr = mutable_options->color_buffers_hdr;
+			mutable_options->color_buffers_hdr = override_value;
+			restore_needed = true;
+		}
+	}
+
+	if (is_streamline_option_logging_enabled() && options != nullptr)
+	{
+		std::string signature = std::string("streamline_dlssd_set_options|") +
+			std::to_string(get_streamline_viewport_value(viewport)) + "|" +
+			std::to_string(options->mode) + "|" +
+			std::to_string(options->output_width) + "|" +
+			std::to_string(options->output_height) + "|" +
+			std::to_string(static_cast<int>(options->color_buffers_hdr));
+		const bool should_log = should_log_streamline_resource_once(std::move(signature)) || restore_needed;
+		if (should_log)
+		{
+			reshade::log::message(reshade::log::level::info,
+				"Vulkan Streamline options: api=slDLSSDSetOptions viewport=%u mode=%u output=%ux%u colorBuffersHDR=%d(%s)%s.",
+				get_streamline_viewport_value(viewport),
+				options->mode,
+				options->output_width,
+				options->output_height,
+				static_cast<int>(options->color_buffers_hdr),
+				streamline_boolean_to_string(options->color_buffers_hdr),
+				restore_needed ? " [override applied]" : "");
+		}
+	}
+
+	static const auto trampoline = reshade::hooks::call<sl_dlssd_set_options_fn *>(&HookStreamlineDLSSDSetOptions);
+	const int result = trampoline(viewport, options);
+
+	if (restore_needed)
+		const_cast<streamline_abi::dlssd_options *>(options)->color_buffers_hdr = restore_color_buffers_hdr;
+
+	return result;
+}
+
+static int HookStreamlineDLSSGSetOptions(const void *viewport, const streamline_abi::dlssg_options *options)
+{
+	const streamline_option_overrides &overrides = get_streamline_option_overrides();
+	bool restore_color_buffer_format = false;
+	bool restore_mvec_buffer_format = false;
+	bool restore_depth_buffer_format = false;
+	bool restore_hudless_buffer_format = false;
+	bool restore_ui_buffer_format = false;
+	uint32_t old_color_buffer_format = 0;
+	uint32_t old_mvec_buffer_format = 0;
+	uint32_t old_depth_buffer_format = 0;
+	uint32_t old_hudless_buffer_format = 0;
+	uint32_t old_ui_buffer_format = 0;
+
+	if (options != nullptr)
+	{
+		streamline_abi::dlssg_options *const mutable_options = const_cast<streamline_abi::dlssg_options *>(options);
+		uint32_t override_value = 0;
+
+		if (try_get_override_u32(overrides.dlssg_color_buffer_format, override_value) &&
+			mutable_options->color_buffer_format != override_value)
+		{
+			old_color_buffer_format = mutable_options->color_buffer_format;
+			mutable_options->color_buffer_format = override_value;
+			restore_color_buffer_format = true;
+		}
+		if (try_get_override_u32(overrides.dlssg_mvec_buffer_format, override_value) &&
+			mutable_options->mvec_buffer_format != override_value)
+		{
+			old_mvec_buffer_format = mutable_options->mvec_buffer_format;
+			mutable_options->mvec_buffer_format = override_value;
+			restore_mvec_buffer_format = true;
+		}
+		if (try_get_override_u32(overrides.dlssg_depth_buffer_format, override_value) &&
+			mutable_options->depth_buffer_format != override_value)
+		{
+			old_depth_buffer_format = mutable_options->depth_buffer_format;
+			mutable_options->depth_buffer_format = override_value;
+			restore_depth_buffer_format = true;
+		}
+		if (try_get_override_u32(overrides.dlssg_hudless_buffer_format, override_value) &&
+			mutable_options->hudless_buffer_format != override_value)
+		{
+			old_hudless_buffer_format = mutable_options->hudless_buffer_format;
+			mutable_options->hudless_buffer_format = override_value;
+			restore_hudless_buffer_format = true;
+		}
+		if (try_get_override_u32(overrides.dlssg_ui_buffer_format, override_value) &&
+			mutable_options->ui_buffer_format != override_value)
+		{
+			old_ui_buffer_format = mutable_options->ui_buffer_format;
+			mutable_options->ui_buffer_format = override_value;
+			restore_ui_buffer_format = true;
+		}
+	}
+
+	const bool any_override_applied =
+		restore_color_buffer_format ||
+		restore_mvec_buffer_format ||
+		restore_depth_buffer_format ||
+		restore_hudless_buffer_format ||
+		restore_ui_buffer_format;
+
+	if (is_streamline_option_logging_enabled() && options != nullptr)
+	{
+		std::string signature = std::string("streamline_dlssg_set_options|") +
+			std::to_string(get_streamline_viewport_value(viewport)) + "|" +
+			std::to_string(options->mode) + "|" +
+			std::to_string(options->num_frames_to_generate) + "|" +
+			std::to_string(options->color_buffer_format) + "|" +
+			std::to_string(options->mvec_buffer_format) + "|" +
+			std::to_string(options->depth_buffer_format) + "|" +
+			std::to_string(options->hudless_buffer_format) + "|" +
+			std::to_string(options->ui_buffer_format);
+		const bool should_log = should_log_streamline_resource_once(std::move(signature)) || any_override_applied;
+		if (should_log)
+		{
+			reshade::log::message(reshade::log::level::info,
+				"Vulkan Streamline options: api=slDLSSGSetOptions viewport=%u mode=%u frames=%u color=%ux%u mvec_depth=%ux%u color_fmt=%u(%s) mvec_fmt=%u(%s) depth_fmt=%u(%s) hudless_fmt=%u(%s) ui_fmt=%u(%s)%s.",
+				get_streamline_viewport_value(viewport),
+				options->mode,
+				options->num_frames_to_generate,
+				options->color_width,
+				options->color_height,
+				options->mvec_depth_width,
+				options->mvec_depth_height,
+				options->color_buffer_format,
+				vk_format_to_string(static_cast<VkFormat>(options->color_buffer_format)),
+				options->mvec_buffer_format,
+				vk_format_to_string(static_cast<VkFormat>(options->mvec_buffer_format)),
+				options->depth_buffer_format,
+				vk_format_to_string(static_cast<VkFormat>(options->depth_buffer_format)),
+				options->hudless_buffer_format,
+				vk_format_to_string(static_cast<VkFormat>(options->hudless_buffer_format)),
+				options->ui_buffer_format,
+				vk_format_to_string(static_cast<VkFormat>(options->ui_buffer_format)),
+				any_override_applied ? " [override applied]" : "");
+		}
+	}
+
+	static const auto trampoline = reshade::hooks::call<sl_dlssg_set_options_fn *>(&HookStreamlineDLSSGSetOptions);
+	const int result = trampoline(viewport, options);
+
+	if (options != nullptr)
+	{
+		streamline_abi::dlssg_options *const mutable_options = const_cast<streamline_abi::dlssg_options *>(options);
+		if (restore_color_buffer_format) mutable_options->color_buffer_format = old_color_buffer_format;
+		if (restore_mvec_buffer_format) mutable_options->mvec_buffer_format = old_mvec_buffer_format;
+		if (restore_depth_buffer_format) mutable_options->depth_buffer_format = old_depth_buffer_format;
+		if (restore_hudless_buffer_format) mutable_options->hudless_buffer_format = old_hudless_buffer_format;
+		if (restore_ui_buffer_format) mutable_options->ui_buffer_format = old_ui_buffer_format;
+	}
+
+	return result;
+}
+
+static int HookStreamlineNISSetOptions(const void *viewport, const streamline_abi::nis_options *options)
+{
+	const streamline_option_overrides &overrides = get_streamline_option_overrides();
+	bool restore_needed = false;
+	uint32_t old_hdr_mode = 0;
+
+	if (options != nullptr && overrides.nis_hdr_mode >= 0)
+	{
+		streamline_abi::nis_options *const mutable_options = const_cast<streamline_abi::nis_options *>(options);
+		const uint32_t override_mode = static_cast<uint32_t>(overrides.nis_hdr_mode);
+		if (mutable_options->hdr_mode != override_mode)
+		{
+			old_hdr_mode = mutable_options->hdr_mode;
+			mutable_options->hdr_mode = override_mode;
+			restore_needed = true;
+		}
+	}
+
+	if (is_streamline_option_logging_enabled() && options != nullptr)
+	{
+		std::string signature = std::string("streamline_nis_set_options|") +
+			std::to_string(get_streamline_viewport_value(viewport)) + "|" +
+			std::to_string(options->mode) + "|" +
+			std::to_string(options->hdr_mode);
+		const bool should_log = should_log_streamline_resource_once(std::move(signature)) || restore_needed;
+		if (should_log)
+		{
+			reshade::log::message(reshade::log::level::info,
+				"Vulkan Streamline options: api=slNISSetOptions viewport=%u mode=%u hdrMode=%u(%s)%s.",
+				get_streamline_viewport_value(viewport),
+				options->mode,
+				options->hdr_mode,
+				streamline_nis_hdr_mode_to_string(options->hdr_mode),
+				restore_needed ? " [override applied]" : "");
+		}
+	}
+
+	static const auto trampoline = reshade::hooks::call<sl_nis_set_options_fn *>(&HookStreamlineNISSetOptions);
+	const int result = trampoline(viewport, options);
+
+	if (restore_needed)
+		const_cast<streamline_abi::nis_options *>(options)->hdr_mode = old_hdr_mode;
+
+	return result;
+}
+
+static int HookStreamlineSetConstants(const void *constants, const void *frame, const void *viewport)
+{
+	if (is_streamline_core_call_logging_enabled())
+	{
+		const auto constants_base = static_cast<const streamline_abi::base_structure *>(constants);
+		const bool has_constants_header = constants_base != nullptr;
+		const uint32_t viewport_value = get_streamline_viewport_value(viewport);
+		const std::string type_string = has_constants_header ? streamline_struct_type_to_string(constants_base->type) : "null";
+		const size_t struct_version = has_constants_header ? constants_base->struct_version : 0;
+
+		std::string signature = std::string("streamline_set_constants|") +
+			std::to_string(viewport_value) + "|" +
+			type_string + "|" +
+			std::to_string(struct_version);
+		if (should_log_streamline_resource_once(std::move(signature)))
+		{
+			reshade::log::message(reshade::log::level::info,
+				"Vulkan Streamline core call: api=slSetConstants frame=%p viewport=%p(viewport_id=%u) constants=%p type=%s version=%zu.",
+				frame,
+				viewport,
+				viewport_value,
+				constants,
+				type_string.c_str(),
+				struct_version);
+		}
+	}
+
+	static const auto trampoline = reshade::hooks::call<sl_set_constants_fn *>(&HookStreamlineSetConstants);
+	return trampoline(constants, frame, viewport);
+}
+
+static int HookStreamlineEvaluateFeature(uint32_t feature, const void *frame, const void *inputs, uint32_t num_inputs, streamline_abi::command_buffer *cmd_buffer)
+{
+	if (is_streamline_core_call_logging_enabled())
+	{
+		std::string signature = std::string("streamline_evaluate_feature|") +
+			std::to_string(feature) + "|" +
+			std::to_string(num_inputs);
+		if (should_log_streamline_resource_once(std::move(signature)))
+		{
+			reshade::log::message(reshade::log::level::info,
+				"Vulkan Streamline core call: api=slEvaluateFeature feature=%u(%s) frame=%p inputs=%p num_inputs=%u cmd=%p.",
+				feature,
+				streamline_feature_to_string(feature),
+				frame,
+				inputs,
+				num_inputs,
+				cmd_buffer);
+		}
+	}
+
+	static const auto trampoline = reshade::hooks::call<sl_evaluate_feature_fn *>(&HookStreamlineEvaluateFeature);
+	return trampoline(feature, frame, inputs, num_inputs, cmd_buffer);
+}
+
+static void log_streamline_tag_entry(const char *api_name, const void *frame, const void *viewport, const streamline_abi::resource_tag &tag, uint32_t tag_index, uint32_t num_tags, streamline_abi::command_buffer *cmd_buffer)
+{
+	const streamline_abi::resource *const resource = tag.resource;
+	const int resource_type = resource != nullptr ? static_cast<int>(resource->type) : -1;
+	const void *const native_handle = resource != nullptr ? resource->native : nullptr;
+	const VkImage image_handle = resource_type == 0 ? reinterpret_cast<VkImage>(resource->native) : VK_NULL_HANDLE;
+
+	tracked_streamline_image_info tracked_image_info;
+	const bool has_tracked_image_info = image_handle != VK_NULL_HANDLE && try_get_tracked_streamline_image(image_handle, tracked_image_info);
+	const VkFormat tracked_format = has_tracked_image_info ? tracked_image_info.format : VK_FORMAT_UNDEFINED;
+	const VkImageUsageFlags tracked_usage = has_tracked_image_info ? tracked_image_info.usage : 0;
+	const VkExtent3D tracked_extent = has_tracked_image_info ? tracked_image_info.extent : VkExtent3D { 0, 0, 0 };
+	const uint32_t viewport_value = get_streamline_viewport_value(viewport);
+	const bool hudless_color = tag.type == 2;
+
+	std::string signature = std::string("streamline_tag|") + api_name + "|" +
+		std::to_string(tag.type) + "|" +
+		std::to_string(static_cast<uint32_t>(tag.lifecycle)) + "|" +
+		std::to_string(reinterpret_cast<uintptr_t>(native_handle)) + "|" +
+		std::to_string(static_cast<int>(tracked_format)) + "|" +
+		std::to_string(resource != nullptr ? resource->native_format : 0) + "|" +
+		std::to_string(resource != nullptr ? resource->state : 0) + "|" +
+		std::to_string(viewport_value);
+	if (!should_log_streamline_resource_once(std::move(signature)))
+		return;
+
+	reshade::log::message(reshade::log::level::info,
+		"Vulkan Streamline tag: api=%s frame=%p viewport=%p(viewport_id=%u) cmd=%p tag=%u/%u type=%u(%s) lifecycle=%u(%s) resource=%p resource_type=%d(%s) native=%p state=%u native_format=%u tracked_format=%d(%s) tracked_usage=%#x tracked_extent=%ux%u resource_extent=%ux%u mips=%u layers=%u view=%p hudless_color=%s.",
+		api_name,
+		frame,
+		viewport,
+		viewport_value,
+		cmd_buffer,
+		tag_index + 1,
+		num_tags,
+		tag.type,
+		streamline_buffer_type_to_string(tag.type),
+		static_cast<uint32_t>(tag.lifecycle),
+		streamline_resource_lifecycle_to_string(tag.lifecycle),
+		resource,
+		resource_type,
+		streamline_resource_type_to_string(resource_type),
+		native_handle,
+		resource != nullptr ? resource->state : 0,
+		resource != nullptr ? resource->native_format : 0,
+		static_cast<int>(tracked_format),
+		vk_format_to_string(tracked_format),
+		static_cast<unsigned int>(tracked_usage),
+		tracked_extent.width,
+		tracked_extent.height,
+		resource != nullptr ? resource->width : 0,
+		resource != nullptr ? resource->height : 0,
+		resource != nullptr ? resource->mip_levels : 0,
+		resource != nullptr ? resource->array_layers : 0,
+		resource != nullptr ? resource->view : nullptr,
+		hudless_color ? "true" : "false");
+}
+
+static void log_streamline_tag_call(const char *api_name, const void *frame, const void *viewport, const streamline_abi::resource_tag *tags, uint32_t num_tags, streamline_abi::command_buffer *cmd_buffer)
+{
+	if (!is_streamline_tag_logging_enabled())
+		return;
+
+	if (tags == nullptr || num_tags == 0)
+	{
+		std::string signature = std::string("streamline_tag_call|") + api_name + "|" +
+			std::to_string(reinterpret_cast<uintptr_t>(viewport)) + "|" +
+			std::to_string(num_tags);
+		if (!should_log_streamline_resource_once(std::move(signature)))
+			return;
+
+		reshade::log::message(reshade::log::level::info,
+			"Vulkan Streamline tag call: api=%s frame=%p viewport=%p(viewport_id=%u) cmd=%p tags=%p num_tags=%u.",
+			api_name,
+			frame,
+			viewport,
+			get_streamline_viewport_value(viewport),
+			cmd_buffer,
+			tags,
+			num_tags);
+		return;
+	}
+
+	for (uint32_t i = 0; i < num_tags; ++i)
+		log_streamline_tag_entry(api_name, frame, viewport, tags[i], i, num_tags, cmd_buffer);
+}
+
+static const streamline_abi::resource_tag *remap_streamline_tag_native_formats(
+	const char *api_name,
+	const streamline_abi::resource_tag *tags,
+	uint32_t num_tags,
+	std::vector<streamline_abi::resource_tag> &tag_storage,
+	std::vector<streamline_abi::resource> &resource_storage)
+{
+	if (tags == nullptr || num_tags == 0)
+		return tags;
+
+	bool has_native_format_mismatch = false;
+
+	for (uint32_t i = 0; i < num_tags; ++i)
+	{
+		const streamline_abi::resource *const tag_resource = tags[i].resource;
+		if (tag_resource == nullptr || tag_resource->type != streamline_abi::resource_type::e_tex2d)
+			continue;
+
+		const VkImage image_handle = reinterpret_cast<VkImage>(tag_resource->native);
+		tracked_streamline_image_info tracked_image_info;
+		if (image_handle == VK_NULL_HANDLE ||
+			!try_get_tracked_streamline_image(image_handle, tracked_image_info) ||
+			tracked_image_info.format == VK_FORMAT_UNDEFINED)
+			continue;
+
+		if (tag_resource->native_format != static_cast<uint32_t>(tracked_image_info.format))
+		{
+			has_native_format_mismatch = true;
+			break;
+		}
+	}
+
+	if (!has_native_format_mismatch)
+		return tags;
+
+	tag_storage.assign(tags, tags + num_tags);
+	resource_storage.clear();
+	resource_storage.reserve(num_tags);
+
+	for (uint32_t i = 0; i < num_tags; ++i)
+	{
+		const streamline_abi::resource *const tag_resource = tags[i].resource;
+		if (tag_resource == nullptr)
+			continue;
+
+		resource_storage.push_back(*tag_resource);
+		streamline_abi::resource &resource_copy = resource_storage.back();
+		tag_storage[i].resource = &resource_copy;
+
+		if (resource_copy.type != streamline_abi::resource_type::e_tex2d)
+			continue;
+
+		const VkImage image_handle = reinterpret_cast<VkImage>(resource_copy.native);
+		tracked_streamline_image_info tracked_image_info;
+		if (image_handle == VK_NULL_HANDLE ||
+			!try_get_tracked_streamline_image(image_handle, tracked_image_info) ||
+			tracked_image_info.format == VK_FORMAT_UNDEFINED)
+			continue;
+
+		const uint32_t tracked_native_format = static_cast<uint32_t>(tracked_image_info.format);
+		if (resource_copy.native_format == tracked_native_format)
+			continue;
+
+		const uint32_t original_native_format = resource_copy.native_format;
+		resource_copy.native_format = tracked_native_format;
+
+		std::string signature = std::string("streamline_tag_native_format_remap|") + api_name + "|" +
+			std::to_string(reinterpret_cast<uintptr_t>(resource_copy.native)) + "|" +
+			std::to_string(static_cast<uint32_t>(tag_storage[i].type)) + "|" +
+			std::to_string(original_native_format) + "|" +
+			std::to_string(tracked_native_format);
+		if (should_log_streamline_resource_once(std::move(signature)))
+		{
+			reshade::log::message(reshade::log::level::info,
+				"Vulkan Streamline tag remap: api=%s native=%p type=%u(%s) native_format=%u -> %u(%s).",
+				api_name,
+				resource_copy.native,
+				static_cast<uint32_t>(tag_storage[i].type),
+				streamline_buffer_type_to_string(tag_storage[i].type),
+				original_native_format,
+				tracked_native_format,
+				vk_format_to_string(tracked_image_info.format));
+		}
+	}
+
+	return tag_storage.data();
+}
+
+static int HookStreamlineSetTag(const void *viewport, const streamline_abi::resource_tag *tags, uint32_t num_tags, streamline_abi::command_buffer *cmd_buffer)
+{
+	std::vector<streamline_abi::resource_tag> tag_storage;
+	std::vector<streamline_abi::resource> resource_storage;
+	const streamline_abi::resource_tag *const remapped_tags =
+		remap_streamline_tag_native_formats("slSetTag", tags, num_tags, tag_storage, resource_storage);
+
+	log_streamline_tag_call("slSetTag", nullptr, viewport, remapped_tags, num_tags, cmd_buffer);
+
+	static const auto trampoline = reshade::hooks::call<sl_set_tag_fn *>(&HookStreamlineSetTag);
+	return trampoline(viewport, remapped_tags, num_tags, cmd_buffer);
+}
+
+static int HookStreamlineSetTagForFrame(const void *frame, const void *viewport, const streamline_abi::resource_tag *tags, uint32_t num_tags, streamline_abi::command_buffer *cmd_buffer)
+{
+	std::vector<streamline_abi::resource_tag> tag_storage;
+	std::vector<streamline_abi::resource> resource_storage;
+	const streamline_abi::resource_tag *const remapped_tags =
+		remap_streamline_tag_native_formats("slSetTagForFrame", tags, num_tags, tag_storage, resource_storage);
+
+	log_streamline_tag_call("slSetTagForFrame", frame, viewport, remapped_tags, num_tags, cmd_buffer);
+
+	static const auto trampoline = reshade::hooks::call<sl_set_tag_for_frame_fn *>(&HookStreamlineSetTagForFrame);
+	return trampoline(frame, viewport, remapped_tags, num_tags, cmd_buffer);
+}
+
+static void try_install_streamline_tag_hooks()
+{
+	const bool install_tag_hooks = is_streamline_tag_logging_enabled();
+	const bool install_option_hooks = is_streamline_option_hooking_enabled();
+	if (!install_tag_hooks && !install_option_hooks)
+		return;
+
+	static std::mutex s_streamline_tag_hook_mutex;
+	static std::atomic<bool> s_streamline_tag_hooks_installed = false;
+	static bool s_streamline_tag_hook_install_failed = false;
+	if (s_streamline_tag_hooks_installed.load(std::memory_order_relaxed))
+		return;
+
+	const std::unique_lock<std::mutex> lock(s_streamline_tag_hook_mutex);
+
+	if (s_streamline_tag_hooks_installed.load(std::memory_order_relaxed))
+		return;
+
+	const HMODULE streamline_module = GetModuleHandleW(L"sl.interposer.dll");
+	if (streamline_module == nullptr)
+		return;
+
+	bool installed_any = false;
+	bool installed_tags = false;
+	bool installed_option_dispatch = false;
+	bool installed_option_direct = false;
+	bool installed_core_calls = false;
+
+	if (install_tag_hooks)
+	{
+		if (const FARPROC set_tag_proc = GetProcAddress(streamline_module, "slSetTag");
+			set_tag_proc != nullptr)
+		{
+			const bool installed = reshade::hooks::install(
+				"slSetTag",
+				reinterpret_cast<reshade::hook::address>(set_tag_proc),
+				reinterpret_cast<reshade::hook::address>(&HookStreamlineSetTag));
+			installed_any |= installed;
+			installed_tags |= installed;
+		}
+
+		if (const FARPROC set_tag_for_frame_proc = GetProcAddress(streamline_module, "slSetTagForFrame");
+			set_tag_for_frame_proc != nullptr)
+		{
+			const bool installed = reshade::hooks::install(
+				"slSetTagForFrame",
+				reinterpret_cast<reshade::hook::address>(set_tag_for_frame_proc),
+				reinterpret_cast<reshade::hook::address>(&HookStreamlineSetTagForFrame));
+			installed_any |= installed;
+			installed_tags |= installed;
+		}
+	}
+
+	if (install_option_hooks)
+	{
+		if (const FARPROC get_feature_function_proc = GetProcAddress(streamline_module, "slGetFeatureFunction");
+			get_feature_function_proc != nullptr)
+		{
+			const bool installed = reshade::hooks::install(
+				"slGetFeatureFunction",
+				reinterpret_cast<reshade::hook::address>(get_feature_function_proc),
+				reinterpret_cast<reshade::hook::address>(&HookStreamlineGetFeatureFunction));
+			installed_any |= installed;
+			installed_option_dispatch |= installed;
+		}
+
+		const auto install_direct_option_hook = [&](const char *function_name)
+		{
+			const FARPROC option_proc = GetProcAddress(streamline_module, function_name);
+			if (option_proc == nullptr)
+				return;
+
+			const bool installed = try_install_streamline_feature_option_hook(function_name, reinterpret_cast<void *>(option_proc));
+			installed_any |= installed;
+			installed_option_direct |= installed;
+		};
+
+		install_direct_option_hook("slDLSSSetOptions");
+		install_direct_option_hook("slDLSSDSetOptions");
+		install_direct_option_hook("slDLSSGSetOptions");
+		install_direct_option_hook("slNISSetOptions");
+
+		if (const FARPROC set_constants_proc = GetProcAddress(streamline_module, "slSetConstants");
+			set_constants_proc != nullptr)
+		{
+			const bool installed = reshade::hooks::install(
+				"slSetConstants",
+				reinterpret_cast<reshade::hook::address>(set_constants_proc),
+				reinterpret_cast<reshade::hook::address>(&HookStreamlineSetConstants));
+			installed_any |= installed;
+			installed_core_calls |= installed;
+		}
+
+		if (const FARPROC evaluate_feature_proc = GetProcAddress(streamline_module, "slEvaluateFeature");
+			evaluate_feature_proc != nullptr)
+		{
+			const bool installed = reshade::hooks::install(
+				"slEvaluateFeature",
+				reinterpret_cast<reshade::hook::address>(evaluate_feature_proc),
+				reinterpret_cast<reshade::hook::address>(&HookStreamlineEvaluateFeature));
+			installed_any |= installed;
+			installed_core_calls |= installed;
+		}
+	}
+
+	if (installed_any)
+	{
+		reshade::log::message(reshade::log::level::info,
+			"Installed Vulkan Streamline hooks (tags=%s, options_dispatch=%s, options_direct=%s, core_calls=%s).",
+			installed_tags ? "true" : "false",
+			installed_option_dispatch ? "true" : "false",
+			installed_option_direct ? "true" : "false",
+			installed_core_calls ? "true" : "false");
+		s_streamline_tag_hooks_installed.store(true, std::memory_order_relaxed);
+		return;
+	}
+
+	if (!s_streamline_tag_hook_install_failed)
+	{
+		reshade::log::message(reshade::log::level::warning,
+			"Failed to install Vulkan Streamline hooks (requested tags=%s options_dispatch=%s).",
+			install_tag_hooks ? "true" : "false",
+			install_option_hooks ? "true" : "false");
+		s_streamline_tag_hook_install_failed = true;
+	}
+}
 
 #if RESHADE_ADDON
 void create_default_view(reshade::vulkan::device_impl *device_impl, VkImage image)
@@ -66,6 +1476,7 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 	reshade::log::message(reshade::log::level::info, "Redirecting vkCreateDevice(physicalDevice = %p, pCreateInfo = %p, pAllocator = %p, pDevice = %p) ...", physicalDevice, pCreateInfo, pAllocator, pDevice);
 
 	assert(pCreateInfo != nullptr && pDevice != nullptr);
+	try_install_streamline_tag_hooks();
 
 	// Look for layer link info if installed as a layer (provided by the Vulkan loader)
 	struct VkLayerDeviceLink
@@ -868,6 +2279,7 @@ static void ModifyAttachments(VkRenderPassCreateInfo* createInfo)
 VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubmits, VkFence fence)
 {
 	assert(pSubmits != nullptr || submitCount == 0);
+	try_install_streamline_tag_hooks();
 
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(queue));
 
@@ -894,11 +2306,33 @@ VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkS
 #endif
 
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(QueueSubmit, device_impl);
-	return trampoline(queue, submitCount, pSubmits, fence);
+	const VkResult result = trampoline(queue, submitCount, pSubmits, fence);
+	if (result < VK_SUCCESS)
+	{
+		static std::atomic<bool> s_logged_queue_submit_failure = false;
+		if (!s_logged_queue_submit_failure.exchange(true, std::memory_order_relaxed))
+		{
+			const uint32_t first_wait_count = (submitCount != 0 && pSubmits != nullptr) ? pSubmits[0].waitSemaphoreCount : 0;
+			const uint32_t first_cmd_count = (submitCount != 0 && pSubmits != nullptr) ? pSubmits[0].commandBufferCount : 0;
+			const uint32_t first_signal_count = (submitCount != 0 && pSubmits != nullptr) ? pSubmits[0].signalSemaphoreCount : 0;
+			reshade::log::message(
+				reshade::log::level::error,
+				"vkQueueSubmit failed (first hit): result=%d queue=%p submit_count=%u first_wait=%u first_cmd=%u first_signal=%u fence=%p.",
+				static_cast<int>(result),
+				queue,
+				submitCount,
+				first_wait_count,
+				first_cmd_count,
+				first_signal_count,
+				fence);
+		}
+	}
+	return result;
 }
 VkResult VKAPI_CALL vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2 *pSubmits, VkFence fence)
 {
 	assert(pSubmits != nullptr || submitCount == 0);
+	try_install_streamline_tag_hooks();
 
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(queue));
 
@@ -925,7 +2359,28 @@ VkResult VKAPI_CALL vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const Vk
 #endif
 
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(QueueSubmit2, device_impl);
-	return trampoline(queue, submitCount, pSubmits, fence);
+	const VkResult result = trampoline(queue, submitCount, pSubmits, fence);
+	if (result < VK_SUCCESS)
+	{
+		static std::atomic<bool> s_logged_queue_submit2_failure = false;
+		if (!s_logged_queue_submit2_failure.exchange(true, std::memory_order_relaxed))
+		{
+			const uint32_t first_wait_count = (submitCount != 0 && pSubmits != nullptr) ? pSubmits[0].waitSemaphoreInfoCount : 0;
+			const uint32_t first_cmd_count = (submitCount != 0 && pSubmits != nullptr) ? pSubmits[0].commandBufferInfoCount : 0;
+			const uint32_t first_signal_count = (submitCount != 0 && pSubmits != nullptr) ? pSubmits[0].signalSemaphoreInfoCount : 0;
+			reshade::log::message(
+				reshade::log::level::error,
+				"vkQueueSubmit2 failed (first hit): result=%d queue=%p submit_count=%u first_wait=%u first_cmd=%u first_signal=%u fence=%p.",
+				static_cast<int>(result),
+				queue,
+				submitCount,
+				first_wait_count,
+				first_cmd_count,
+				first_signal_count,
+				fence);
+		}
+	}
+	return result;
 }
 
 VkResult VKAPI_CALL vkBindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset)
@@ -1238,14 +2693,32 @@ VkResult VKAPI_CALL vkCreateImage(VkDevice device, const VkImageCreateInfo *pCre
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(CreateImage, device_impl);
 
 	assert(pCreateInfo != nullptr && pImage != nullptr);
+	try_install_streamline_tag_hooks();
+	const void *const caller_address = _ReturnAddress();
 
 #if RESHADE_ADDON
 	VkImageCreateInfo create_info = *pCreateInfo;
 	create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	auto desc = reshade::vulkan::convert_resource_desc(create_info);
 	assert(desc.heap == reshade::api::memory_heap::unknown);
+	const VkFormat requested_format = create_info.format;
+	const VkImageUsageFlags requested_usage = create_info.usage;
+	const VkExtent3D requested_extent = create_info.extent;
+	std::string upgrade_trace_module_name;
+	const bool should_trace_addon_upgrade = should_trace_vulkan_addon_image_upgrade(caller_address, create_info, upgrade_trace_module_name);
+	if (should_trace_addon_upgrade)
+	{
+		// Breakpoint marker before add-on callback: inspect requested format/usage prior to 'create_resource'.
+		volatile uint32_t addon_create_resource_breakpoint_before = static_cast<uint32_t>(create_info.format);
+		(void)addon_create_resource_breakpoint_before;
+	}
 
-	if (reshade::invoke_addon_event<reshade::addon_event::create_resource>(device_impl, desc, nullptr, pCreateInfo->initialLayout == VK_IMAGE_LAYOUT_PREINITIALIZED ? reshade::api::resource_usage::cpu_access : reshade::api::resource_usage::undefined))
+	const bool addon_handled_create_resource = reshade::invoke_addon_event<reshade::addon_event::create_resource>(
+		device_impl,
+		desc,
+		nullptr,
+		pCreateInfo->initialLayout == VK_IMAGE_LAYOUT_PREINITIALIZED ? reshade::api::resource_usage::cpu_access : reshade::api::resource_usage::undefined);
+	if (addon_handled_create_resource)
 	{
 		reshade::vulkan::convert_resource_desc(desc, create_info);
 		pCreateInfo = &create_info;
@@ -1259,6 +2732,23 @@ VkResult VKAPI_CALL vkCreateImage(VkDevice device, const VkImageCreateInfo *pCre
 				const_cast<VkImageFormatListCreateInfo *>(format_list_info)->viewFormatCount = 0;
 		}
 	}
+
+	if (should_trace_addon_upgrade)
+	{
+		reshade::log::message(reshade::log::level::info,
+			"Vulkan addon create_resource trace: module=%s handled=%s requested_fmt=%d(%s) final_fmt=%d(%s) requested_usage=%#x final_usage=%#x extent=%ux%ux%u.",
+			upgrade_trace_module_name.c_str(),
+			addon_handled_create_resource ? "true" : "false",
+			static_cast<int>(requested_format),
+			vk_format_to_string(requested_format),
+			static_cast<int>(create_info.format),
+			vk_format_to_string(create_info.format),
+			static_cast<unsigned int>(requested_usage),
+			static_cast<unsigned int>(create_info.usage),
+			requested_extent.width,
+			requested_extent.height,
+			requested_extent.depth);
+	}
 #endif
 
 	const VkResult result = trampoline(device, pCreateInfo, pAllocator, pImage);
@@ -1269,6 +2759,10 @@ VkResult VKAPI_CALL vkCreateImage(VkDevice device, const VkImageCreateInfo *pCre
 #endif
 		return result;
 	}
+
+	log_streamline_image_creation(caller_address, *pCreateInfo, *pImage);
+	log_vulkan_image_creation_origin(caller_address, *pCreateInfo, *pImage);
+	track_streamline_image_for_tags(*pImage, *pCreateInfo);
 
 #if RESHADE_ADDON
 	reshade::vulkan::object_data<VK_OBJECT_TYPE_IMAGE> &data = *device_impl->register_object<VK_OBJECT_TYPE_IMAGE>(*pImage);
@@ -1285,6 +2779,7 @@ void     VKAPI_CALL vkDestroyImage(VkDevice device, VkImage image, const VkAlloc
 
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(device));
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(DestroyImage, device_impl);
+	untrack_streamline_image_for_tags(image);
 
 #if RESHADE_ADDON
 	reshade::invoke_addon_event<reshade::addon_event::destroy_resource>(device_impl, reshade::api::resource { (uint64_t)image });
@@ -1303,6 +2798,8 @@ VkResult VKAPI_CALL vkCreateImageView(VkDevice device, const VkImageViewCreateIn
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(CreateImageView, device_impl);
 
 	assert(pCreateInfo != nullptr && pView != nullptr);
+	try_install_streamline_tag_hooks();
+	const void *const caller_address = _ReturnAddress();
 
 #if RESHADE_ADDON
 	VkImageViewCreateInfo create_info = *pCreateInfo;
@@ -1332,6 +2829,8 @@ VkResult VKAPI_CALL vkCreateImageView(VkDevice device, const VkImageViewCreateIn
 #endif
 		return result;
 	}
+
+	log_streamline_image_view_creation(device_impl, caller_address, *pCreateInfo, *pView);
 
 #if RESHADE_ADDON
 	reshade::vulkan::object_data<VK_OBJECT_TYPE_IMAGE_VIEW> &data = *device_impl->register_object<VK_OBJECT_TYPE_IMAGE_VIEW>(*pView);

@@ -24,6 +24,22 @@ static POINT s_last_cursor_position = {};
 static std::atomic<bool> s_block_mouse = false;
 static std::atomic<bool> s_block_keyboard = false;
 static std::atomic<bool> s_block_cursor_warping = false;
+static std::atomic<bool> s_streamline_fg_overlay_capture = false;
+
+static bool is_streamline_dlssg_active()
+{
+	if (GetModuleHandleW(L"sl.interposer.dll") == nullptr)
+		return false;
+
+	return
+		GetModuleHandleW(L"sl.dlss_g.dll") != nullptr ||
+		GetModuleHandleW(L"nvngx_dlssg.dll") != nullptr;
+}
+
+static bool is_streamline_fg_overlay_capture_active()
+{
+	return is_streamline_dlssg_active() && s_streamline_fg_overlay_capture.load(std::memory_order_relaxed);
+}
 
 extern "C" BOOL WINAPI HookClipCursor(const RECT *lpRect);
 extern "C" auto WINAPI HookGetKeyState(int vKey) -> SHORT;
@@ -47,6 +63,34 @@ void reshade::input::register_window_with_raw_input(window_handle window, bool n
 	const auto insert = s_raw_input_windows.emplace(static_cast<HWND>(window), flags);
 
 	if (!insert.second) insert.first->second |= flags;
+}
+
+static void unregister_raw_input_usage(USHORT usage_page, USHORT usage)
+{
+	if (usage_page != 1)
+		return;
+
+	unsigned int remove_mask = 0;
+	if (usage == 0x06)
+		remove_mask = 0x1;
+	else if (usage == 0x02)
+		remove_mask = 0x2;
+	else
+		return;
+
+	const std::unique_lock<std::shared_mutex> lock(s_windows_mutex, std::try_to_lock);
+	if (!lock.owns_lock())
+		return;
+
+	for (auto it = s_raw_input_windows.begin(); it != s_raw_input_windows.end();)
+	{
+		it->second &= ~remove_mask;
+
+		if (it->second == 0)
+			it = s_raw_input_windows.erase(it);
+		else
+			++it;
+	}
 }
 
 std::shared_ptr<reshade::input> reshade::input::register_window(window_handle window)
@@ -94,6 +138,11 @@ bool reshade::input::handle_window_message(const void *message_data)
 	// Ignore messages that are not related to mouse or keyboard input
 	if (details.message != WM_INPUT && !is_mouse_message && !is_keyboard_message)
 		return false;
+
+	// In Streamline FG fallback mode there may be no input object registered, so block input
+	// messages globally while the overlay is open.
+	if (is_streamline_fg_overlay_capture_active())
+		return true;
 
 	// Guard access to windows list against race conditions
 	std::unique_lock<std::shared_mutex> lock(s_windows_mutex);
@@ -429,21 +478,24 @@ void reshade::input::next_frame()
 		(_keys[VK_SNAPSHOT] = 0x88),
 		(_keys_time[VK_SNAPSHOT] = time);
 
-	// Run through all forms of input blocking for all windows and establish whether any of them are blocking input
-	const std::shared_lock<std::shared_mutex> lock(s_windows_mutex);
-
-	s_block_mouse.store(std::any_of(s_windows.cbegin(), s_windows.cend(),
-		[](const std::pair<HWND, std::weak_ptr<reshade::input>> &input_window) {
-			return !input_window.second.expired() && input_window.second.lock()->is_blocking_mouse_input();
-		}));
-	s_block_keyboard.store(std::any_of(s_windows.cbegin(), s_windows.cend(),
-		[](const std::pair<HWND, std::weak_ptr<reshade::input>> &input_window) {
-			return !input_window.second.expired() && input_window.second.lock()->is_blocking_keyboard_input();
-		}));
-	s_block_cursor_warping.store(std::any_of(s_windows.cbegin(), s_windows.cend(),
-		[](const std::pair<HWND, std::weak_ptr<reshade::input>> &input_window) {
-			return !input_window.second.expired() && input_window.second.lock()->is_blocking_mouse_cursor_warping();
-		}));
+	// Avoid blocking here while holding the input mutex, since the window message path locks
+	// the mutexes in reverse order ('s_windows_mutex' first, then input mutex).
+	const std::shared_lock<std::shared_mutex> lock(s_windows_mutex, std::try_to_lock);
+	if (lock.owns_lock())
+	{
+		s_block_mouse.store(std::any_of(s_windows.cbegin(), s_windows.cend(),
+			[](const std::pair<HWND, std::weak_ptr<reshade::input>> &input_window) {
+				return !input_window.second.expired() && input_window.second.lock()->is_blocking_mouse_input();
+			}));
+		s_block_keyboard.store(std::any_of(s_windows.cbegin(), s_windows.cend(),
+			[](const std::pair<HWND, std::weak_ptr<reshade::input>> &input_window) {
+				return !input_window.second.expired() && input_window.second.lock()->is_blocking_keyboard_input();
+			}));
+		s_block_cursor_warping.store(std::any_of(s_windows.cbegin(), s_windows.cend(),
+			[](const std::pair<HWND, std::weak_ptr<reshade::input>> &input_window) {
+				return !input_window.second.expired() && input_window.second.lock()->is_blocking_mouse_cursor_warping();
+			}));
+	}
 }
 
 std::string reshade::input::key_name(unsigned int keycode)
@@ -542,8 +594,28 @@ bool reshade::input::is_blocking_any_mouse_cursor_warping()
 	return s_block_cursor_warping.load();
 }
 
+void reshade::input::set_streamline_fg_overlay_capture(bool enable)
+{
+	const bool was_enabled = s_streamline_fg_overlay_capture.exchange(enable, std::memory_order_relaxed);
+	if (was_enabled == enable)
+		return;
+
+	static const auto ClipCursor_trampoline = reshade::hooks::is_hooked(ClipCursor) ? reshade::hooks::call(HookClipCursor, ClipCursor) : ClipCursor;
+
+	if (enable)
+	{
+		ClipCursor_trampoline(nullptr);
+	}
+	else if ((s_last_clip_cursor.right - s_last_clip_cursor.left) != 0 && (s_last_clip_cursor.bottom - s_last_clip_cursor.top) != 0)
+	{
+		ClipCursor_trampoline(&s_last_clip_cursor);
+	}
+}
+
 extern "C" BOOL WINAPI HookGetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)
 {
+	static const auto trampoline = reshade::hooks::call(HookGetMessageA);
+
 #ifndef RESHADE_TEST_APPLICATION
 	DWORD mask = QS_ALLINPUT;
 	if (wMsgFilterMin != 0 || wMsgFilterMax != 0)
@@ -580,7 +652,6 @@ extern "C" BOOL WINAPI HookGetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMi
 		}
 	}
 #else
-	static const auto trampoline = reshade::hooks::call(HookGetMessageA);
 	const BOOL result = trampoline(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
 	if (result < 0) // If there is an error, the return value is negative (https://docs.microsoft.com/windows/win32/api/winuser/nf-winuser-getmessage)
 		return result;
@@ -601,6 +672,8 @@ extern "C" BOOL WINAPI HookGetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMi
 }
 extern "C" BOOL WINAPI HookGetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)
 {
+	static const auto trampoline = reshade::hooks::call(HookGetMessageW);
+
 #ifndef RESHADE_TEST_APPLICATION
 	DWORD mask = QS_ALLINPUT;
 	if (wMsgFilterMin != 0 || wMsgFilterMax != 0)
@@ -634,7 +707,6 @@ extern "C" BOOL WINAPI HookGetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMi
 		}
 	}
 #else
-	static const auto trampoline = reshade::hooks::call(HookGetMessageW);
 	const BOOL result = trampoline(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
 	if (result < 0)
 		return result;
@@ -656,6 +728,7 @@ extern "C" BOOL WINAPI HookGetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMi
 extern "C" BOOL WINAPI HookPeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg)
 {
 	static const auto trampoline = reshade::hooks::call(HookPeekMessageA);
+
 	if (!trampoline(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg) || lpMsg == nullptr)
 		return FALSE;
 
@@ -673,6 +746,7 @@ extern "C" BOOL WINAPI HookPeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterM
 extern "C" BOOL WINAPI HookPeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg)
 {
 	static const auto trampoline = reshade::hooks::call(HookPeekMessageW);
+
 	if (!trampoline(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg) || lpMsg == nullptr)
 		return FALSE;
 
@@ -708,6 +782,8 @@ extern "C" BOOL WINAPI HookPostMessageW(HWND hWnd, UINT Msg, WPARAM wParam, LPAR
 
 extern "C" BOOL WINAPI HookRegisterRawInputDevices(PCRAWINPUTDEVICE pRawInputDevices, UINT uiNumDevices, UINT cbSize)
 {
+	static const auto trampoline = reshade::hooks::call(HookRegisterRawInputDevices);
+
 #if RESHADE_VERBOSE_LOG
 	reshade::log::message(
 		reshade::log::level::debug,
@@ -731,47 +807,87 @@ extern "C" BOOL WINAPI HookRegisterRawInputDevices(PCRAWINPUTDEVICE pRawInputDev
 		reshade::log::message(reshade::log::level::debug, "  +-----------------------------------------+-----------------------------------------+");
 #endif
 
-		if (device.usUsagePage != 1 || device.hwndTarget == nullptr)
-			continue;
-
-		reshade::input::register_window_with_raw_input(device.hwndTarget, device.usUsage == 0x06 && (device.dwFlags & RIDEV_NOLEGACY) != 0, device.usUsage == 0x02 && (device.dwFlags & RIDEV_NOLEGACY) != 0);
 	}
 
-	static const auto trampoline = reshade::hooks::call(HookRegisterRawInputDevices);
 	if (!trampoline(pRawInputDevices, uiNumDevices, cbSize))
 	{
 		reshade::log::message(reshade::log::level::warning, "RegisterRawInputDevices failed with error code %lu.", GetLastError());
 		return FALSE;
 	}
 
+#if RESHADE_VERBOSE_LOG
+	reshade::log::message(reshade::log::level::debug, "RegisterRawInputDevices succeeded.");
+#endif
+
+	// Update raw input bookkeeping only after the system call succeeded.
+	// Doing this before the trampoline can deadlock with re-entrant message handling.
+	for (UINT i = 0; i < uiNumDevices; ++i)
+	{
+		const RAWINPUTDEVICE &device = pRawInputDevices[i];
+
+		if ((device.dwFlags & RIDEV_REMOVE) != 0)
+		{
+			unregister_raw_input_usage(device.usUsagePage, device.usUsage);
+			continue;
+		}
+
+		if (device.usUsagePage != 1 || device.hwndTarget == nullptr)
+			continue;
+
+		const std::unique_lock<std::shared_mutex> lock(s_windows_mutex, std::try_to_lock);
+		if (!lock.owns_lock())
+			continue;
+
+		const unsigned int flags =
+			((device.usUsage == 0x06 && (device.dwFlags & RIDEV_NOLEGACY) != 0) ? 0x1u : 0u) |
+			((device.usUsage == 0x02 && (device.dwFlags & RIDEV_NOLEGACY) != 0) ? 0x2u : 0u);
+
+		if (flags == 0)
+			continue;
+
+		auto insert = s_raw_input_windows.emplace(device.hwndTarget, flags);
+		if (!insert.second)
+			insert.first->second |= flags;
+	}
+
+#if RESHADE_VERBOSE_LOG
+	reshade::log::message(reshade::log::level::debug, "RegisterRawInputDevices bookkeeping completed.");
+#endif
+
 	return TRUE;
 }
 
 extern "C" BOOL WINAPI HookClipCursor(const RECT *lpRect)
 {
+	static const auto trampoline = reshade::hooks::call(HookClipCursor);
+	const bool fg_overlay_capture = is_streamline_fg_overlay_capture_active();
+
 	s_last_clip_cursor = (lpRect != nullptr) ? *lpRect : RECT {};
 
-	if (reshade::input::is_blocking_any_mouse_input() || reshade::input::is_blocking_any_mouse_cursor_warping())
+	if (fg_overlay_capture || reshade::input::is_blocking_any_mouse_input() || reshade::input::is_blocking_any_mouse_cursor_warping())
 		// Some applications clip the mouse cursor, so disable that while we want full control over mouse input
 		lpRect = nullptr;
 
-	static const auto trampoline = reshade::hooks::call(HookClipCursor);
 	return trampoline(lpRect);
 }
 
 extern "C" BOOL WINAPI HookSetCursorPosition(int X, int Y)
 {
+	static const auto trampoline = reshade::hooks::call(HookSetCursorPosition);
+	const bool fg_overlay_capture = is_streamline_fg_overlay_capture_active();
+
 	s_last_cursor_position.x = X;
 	s_last_cursor_position.y = Y;
 
-	if (reshade::input::is_blocking_any_mouse_cursor_warping())
+	if (fg_overlay_capture || reshade::input::is_blocking_any_mouse_cursor_warping())
 		return TRUE;
 
-	static const auto trampoline = reshade::hooks::call(HookSetCursorPosition);
 	return trampoline(X, Y);
 }
 extern "C" BOOL WINAPI HookGetCursorPosition(LPPOINT lpPoint)
 {
+	static const auto trampoline = reshade::hooks::call(HookGetCursorPosition);
+
 	if (reshade::input::is_blocking_any_mouse_input())
 	{
 		assert(lpPoint != nullptr);
@@ -781,7 +897,6 @@ extern "C" BOOL WINAPI HookGetCursorPosition(LPPOINT lpPoint)
 		return TRUE;
 	}
 
-	static const auto trampoline = reshade::hooks::call(HookGetCursorPosition);
 	const BOOL result = trampoline(lpPoint);
 	if (result)
 	{
@@ -796,6 +911,8 @@ extern "C" BOOL WINAPI HookGetCursorPosition(LPPOINT lpPoint)
 
 extern "C" auto WINAPI HookGetKeyState(int vKey) -> SHORT
 {
+	static const auto trampoline = reshade::hooks::call(HookGetKeyState);
+
 	// Valid keyboard keys are between 8 and 255
 	if ((vKey & 0xF8) != 0)
 	{
@@ -809,11 +926,12 @@ extern "C" auto WINAPI HookGetKeyState(int vKey) -> SHORT
 			return 0;
 	}
 
-	static const auto trampoline = reshade::hooks::call(HookGetKeyState);
 	return trampoline(vKey);
 }
 extern "C" auto WINAPI HookGetAsyncKeyState(int vKey) -> SHORT
 {
+	static const auto trampoline = reshade::hooks::call(HookGetAsyncKeyState);
+
 	// Valid keyboard keys are between 8 and 255
 	if ((vKey & 0xF8) != 0)
 	{
@@ -827,12 +945,12 @@ extern "C" auto WINAPI HookGetAsyncKeyState(int vKey) -> SHORT
 			return 0;
 	}
 
-	static const auto trampoline = reshade::hooks::call(HookGetAsyncKeyState);
 	return trampoline(vKey);
 }
 extern "C" BOOL WINAPI HookGetKeyboardState(PBYTE lpKeyState)
 {
 	static const auto trampoline = reshade::hooks::call(HookGetKeyboardState);
+
 	const BOOL result = trampoline(lpKeyState);
 	if (result)
 	{
@@ -850,8 +968,10 @@ extern "C" UINT WINAPI HookGetRawInputBuffer(PRAWINPUT pData, PUINT pcbSize, UIN
 {
 	static const auto trampoline = reshade::hooks::call(HookGetRawInputBuffer);
 	const UINT result = trampoline(pData, pcbSize, cbSizeHeader);
+	const bool fg_overlay_capture = is_streamline_fg_overlay_capture_active();
+
 	// This is a high throughput API (i.e. 8 kHz mouse polling), so need a fast path to exit
-	if (result == static_cast<UINT>(-1) || pData == nullptr || *pcbSize == 0 || !(reshade::input::is_blocking_any_mouse_input() || reshade::input::is_blocking_any_keyboard_input()))
+	if (result == static_cast<UINT>(-1) || pData == nullptr || *pcbSize == 0 || !(fg_overlay_capture || reshade::input::is_blocking_any_mouse_input() || reshade::input::is_blocking_any_keyboard_input()))
 		return result;
 
 	using QWORD = UINT64;
@@ -861,7 +981,7 @@ extern "C" UINT WINAPI HookGetRawInputBuffer(PRAWINPUT pData, PUINT pcbSize, UIN
 		switch (pData->header.dwType)
 		{
 		case RIM_TYPEMOUSE:
-			if (reshade::input::is_blocking_any_mouse_input())
+			if (fg_overlay_capture || reshade::input::is_blocking_any_mouse_input())
 			{
 				pData->header.hDevice = nullptr;
 				pData->header.wParam = RIM_INPUTSINK;
@@ -871,7 +991,7 @@ extern "C" UINT WINAPI HookGetRawInputBuffer(PRAWINPUT pData, PUINT pcbSize, UIN
 			}
 			break;
 		case RIM_TYPEKEYBOARD:
-			if (reshade::input::is_blocking_any_keyboard_input())
+			if (fg_overlay_capture || reshade::input::is_blocking_any_keyboard_input())
 			{
 				// Supplying an invalid device will early-out SDL before it calls HID APIs to try and get an input report that we don't want it to see
 				pData->header.hDevice = nullptr;
@@ -931,6 +1051,8 @@ static LRESULT CALLBACK handle_windows_hook(int nCode, WPARAM wParam, LPARAM lPa
 
 extern "C" HHOOK WINAPI HookSetWindowsHookExA(int idHook, HOOKPROC lpfn, HINSTANCE hmod, DWORD dwThreadId)
 {
+	static const auto trampoline = reshade::hooks::call(HookSetWindowsHookExA);
+
 #if RESHADE_VERBOSE_LOG
 	reshade::log::message(reshade::log::level::info, "Redirecting SetWindowsHookExA(idHook = %d, lpfn = %p, hmod = %p, dwThreadId = %lu) ...", idHook, lpfn, hmod, dwThreadId);
 #endif
@@ -964,7 +1086,6 @@ extern "C" HHOOK WINAPI HookSetWindowsHookExA(int idHook, HOOKPROC lpfn, HINSTAN
 #endif
 	}
 
-	static const auto trampoline = reshade::hooks::call(HookSetWindowsHookExA);
 	const HHOOK result = trampoline(idHook, lpfn, hmod, dwThreadId);
 
 	if (result != nullptr && lpfn != orig_hook_proc)
@@ -980,6 +1101,8 @@ extern "C" HHOOK WINAPI HookSetWindowsHookExA(int idHook, HOOKPROC lpfn, HINSTAN
 }
 extern "C" HHOOK WINAPI HookSetWindowsHookExW(int idHook, HOOKPROC lpfn, HINSTANCE hmod, DWORD dwThreadId)
 {
+	static const auto trampoline = reshade::hooks::call(HookSetWindowsHookExW);
+
 #if RESHADE_VERBOSE_LOG
 	reshade::log::message(reshade::log::level::info, "Redirecting SetWindowsHookExW(idHook = %d, lpfn = %p, hmod = %p, dwThreadId = %lu) ...", idHook, lpfn, hmod, dwThreadId);
 #endif
@@ -1013,7 +1136,6 @@ extern "C" HHOOK WINAPI HookSetWindowsHookExW(int idHook, HOOKPROC lpfn, HINSTAN
 #endif
 	}
 
-	static const auto trampoline = reshade::hooks::call(HookSetWindowsHookExW);
 	const HHOOK result = trampoline(idHook, lpfn, hmod, dwThreadId);
 
 	if (result != nullptr && lpfn != orig_hook_proc)
@@ -1029,6 +1151,8 @@ extern "C" HHOOK WINAPI HookSetWindowsHookExW(int idHook, HOOKPROC lpfn, HINSTAN
 }
 extern "C" BOOL  WINAPI HookUnhookWindowsHookEx(HHOOK hhk)
 {
+	static const auto trampoline = reshade::hooks::call(HookUnhookWindowsHookEx);
+
 #if RESHADE_VERBOSE_LOG
 	reshade::log::message(reshade::log::level::info, "Redirecting UnhookWindowsHookEx(hhk = %p) ...", hhk);
 #endif
@@ -1046,6 +1170,5 @@ extern "C" BOOL  WINAPI HookUnhookWindowsHookEx(HHOOK hhk)
 		}
 	}
 
-	static const auto trampoline = reshade::hooks::call(HookUnhookWindowsHookEx);
 	return trampoline(hhk);
 }

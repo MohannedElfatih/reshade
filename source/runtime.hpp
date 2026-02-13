@@ -44,6 +44,17 @@ namespace reshade
 		api::device *get_device() final { return _device; }
 		api::swapchain *get_swapchain() { return _swapchain; }
 		api::command_queue *get_command_queue() final { return _graphics_queue; }
+		void set_command_queue(api::command_queue *graphics_queue)
+		{
+			if (graphics_queue == nullptr || graphics_queue == _graphics_queue)
+				return;
+
+			_graphics_queue = graphics_queue;
+
+#if RESHADE_GUI
+			_timestamp_frequency = _graphics_queue->get_timestamp_frequency();
+#endif
+		}
 
 		void *get_hwnd() const final { return _swapchain->get_hwnd(); }
 
@@ -238,7 +249,7 @@ namespace reshade
 
 		api::swapchain *const _swapchain;
 		api::device *const _device;
-		api::command_queue *const _graphics_queue;
+		api::command_queue *_graphics_queue;
 		unsigned int _width = 0;
 		unsigned int _height = 0;
 		unsigned int _vendor_id = 0;
@@ -428,11 +439,13 @@ namespace reshade
 		bool _show_screenshot_message = true;
 		bool _show_preset_transition_message = true;
 		unsigned int _reload_count = 0;
+		bool _can_use_input_for_gui = true;
 
 		bool _is_font_scaling = false;
 		bool _no_font_scaling = false;
 		bool _block_input_next_frame = false;
 		bool _rebuild_font_atlas = true;
+		bool _overlay_key_was_down = false;
 		unsigned int _overlay_key_data[4];
 		unsigned int _fps_key_data[4] = {};
 		unsigned int _frametime_key_data[4] = {};

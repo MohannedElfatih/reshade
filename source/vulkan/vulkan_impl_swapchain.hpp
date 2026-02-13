@@ -4,6 +4,7 @@
  */
 
 #pragma once
+#include <mutex>
 
 namespace reshade::vulkan
 {
@@ -22,6 +23,7 @@ namespace reshade::vulkan
 
 		uint32_t get_back_buffer_count() const final;
 		uint32_t get_current_back_buffer_index() const final;
+		std::recursive_mutex &get_runtime_mutex() { return _runtime_mutex; }
 
 		bool check_color_space_support(api::color_space color_space) const final;
 
@@ -34,6 +36,7 @@ namespace reshade::vulkan
 		VkSwapchainCreateInfoKHR _create_info = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
 		HWND _hwnd = nullptr;
 		uint32_t _swap_index = 0;
+		mutable std::recursive_mutex _runtime_mutex;
 	};
 
 	template <>
@@ -46,8 +49,10 @@ namespace reshade::vulkan
 
 		using swapchain_impl::_create_info;
 		using swapchain_impl::_hwnd;
+		using swapchain_impl::_runtime_mutex;
 		using swapchain_impl::_swap_index;
 
+		bool _effect_runtime_enabled = true;
 		HMONITOR hmonitor = nullptr;
 	};
 }

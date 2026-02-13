@@ -23,8 +23,25 @@
 #include <cstdlib> // std::lldiv, std::strtol
 #include <cstring> // std::memcmp, std::memcpy
 #include <algorithm> // std::any_of, std::count_if, std::find, std::find_if, std::max, std::min, std::replace, std::rotate, std::search, std::swap, std::transform
+#if _WIN32
+#include <Windows.h>
+#endif
 
 extern bool resolve_path(std::filesystem::path &path, std::error_code &ec);
+
+static bool is_streamline_dlssg_active_gui()
+{
+#if _WIN32
+	if (GetModuleHandleW(L"sl.interposer.dll") == nullptr)
+		return false;
+
+	return
+		GetModuleHandleW(L"sl.dlss_g.dll") != nullptr ||
+		GetModuleHandleW(L"nvngx_dlssg.dll") != nullptr;
+#else
+	return false;
+#endif
+}
 
 static bool string_contains(const std::string_view text, const std::string_view filter)
 {
@@ -755,17 +772,39 @@ void reshade::runtime::save_custom_style() const
 void reshade::runtime::draw_gui()
 {
 	assert(_is_initialized);
+	const bool streamline_fg_active = _device->get_api() == api::device_api::vulkan && is_streamline_dlssg_active_gui();
 
 	bool show_overlay = _show_overlay;
 	api::input_source show_overlay_source = _imgui_context->NavInputSource == ImGuiInputSource_Mouse ? api::input_source::mouse : api::input_source::keyboard;
+	const bool can_use_input = _input != nullptr && _can_use_input_for_gui;
+	bool overlay_toggle_pressed = false;
 
-	if (_input != nullptr)
+#if _WIN32
+	if (!_ignore_shortcuts && (_imgui_context->ActiveId == 0 || !_show_overlay))
+	{
+		const bool overlay_key_is_simple = _overlay_key_data[1] == 0 && _overlay_key_data[2] == 0 && _overlay_key_data[3] == 0;
+		bool overlay_key_down = false;
+		if (overlay_key_is_simple && _overlay_key_data[0] != 0)
+			overlay_key_down = (::GetAsyncKeyState(_overlay_key_data[0]) & 0x8000) != 0;
+
+		if (overlay_key_down && !_overlay_key_was_down)
+			overlay_toggle_pressed = true;
+
+		_overlay_key_was_down = overlay_key_down;
+	}
+#else
+	_overlay_key_was_down = false;
+#endif
+
+	if (can_use_input)
 	{
 		if (_show_overlay && !_ignore_shortcuts && _input->is_key_pressed(0x1B /* VK_ESCAPE */) &&
 			(_input_processing_mode == 2 || (_input_processing_mode == 1 && (_imgui_context->IO.WantCaptureMouse || _imgui_context->IO.WantCaptureKeyboard))) && !_imgui_context->IO.NavVisible)
 			show_overlay = false; // Close when pressing the escape button, input focus is on the overlay and not currently navigating with the keyboard
-		else if (!_ignore_shortcuts && _input->is_key_pressed(_overlay_key_data, _force_shortcut_modifiers) && _imgui_context->ActiveId == 0)
-			show_overlay = !_show_overlay;
+		else if (!_ignore_shortcuts && (_imgui_context->ActiveId == 0 || !_show_overlay))
+		{
+			overlay_toggle_pressed |= _input->is_key_pressed(_overlay_key_data, _force_shortcut_modifiers);
+		}
 
 		if (!_ignore_shortcuts)
 		{
@@ -774,6 +813,17 @@ void reshade::runtime::draw_gui()
 			if (_input->is_key_pressed(_frametime_key_data, _force_shortcut_modifiers))
 				_show_frametime = _show_frametime ? 0 : 1;
 		}
+	}
+
+	if (overlay_toggle_pressed)
+	{
+		log::message(log::level::info,
+			"Overlay toggle requested (current_open=%s, can_use_input=%s, ignore_shortcuts=%s, active_id=%u).",
+			_show_overlay ? "true" : "false",
+			can_use_input ? "true" : "false",
+			_ignore_shortcuts ? "true" : "false",
+			static_cast<unsigned int>(_imgui_context->ActiveId));
+		show_overlay = !_show_overlay;
 	}
 
 	if (_input_gamepad != nullptr)
@@ -789,6 +839,10 @@ void reshade::runtime::draw_gui()
 
 	if (show_overlay != _show_overlay)
 		open_overlay(show_overlay, show_overlay_source);
+
+	// When running Streamline FG without a ReShade input object, enable overlay capture at hook level
+	// while the menu is open, so cursor warping/input suppression still behaves like normal overlay mode.
+	input::set_streamline_fg_overlay_capture(streamline_fg_active && _input == nullptr && _show_overlay);
 
 	const bool show_splash_window = _show_splash && (is_loading() || (_reload_count <= 1 && (_last_present_time - _last_reload_time) < std::chrono::seconds(5)) || (!_show_overlay && _tutorial_index == 0 && _input != nullptr));
 
@@ -828,9 +882,11 @@ void reshade::runtime::draw_gui()
 	{
 		if (_primary_input_handler && _input != nullptr)
 		{
-			_input->block_mouse_input(_block_input_next_frame);
-			_input->block_keyboard_input(_block_input_next_frame);
-			_input->block_mouse_cursor_warping(_block_input_next_frame);
+			const bool block_input = _block_input_next_frame;
+
+			_input->block_mouse_input(block_input);
+			_input->block_keyboard_input(block_input);
+			_input->block_mouse_cursor_warping(block_input);
 		}
 		return; // Early-out to avoid costly ImGui calls when no GUI elements are on the screen
 	}
@@ -977,6 +1033,62 @@ void reshade::runtime::draw_gui()
 		for (ImWchar16 c : _input->text_input())
 			imgui_io.AddInputCharacterUTF16(c);
 	}
+#if _WIN32
+	else
+	{
+		static bool s_logged_win32_polling_fallback = false;
+		if (!s_logged_win32_polling_fallback)
+		{
+			log::message(log::level::debug,
+				"Vulkan Streamline FG GUI: using Win32 polling fallback input (no ReShade input capture object).");
+			s_logged_win32_polling_fallback = true;
+		}
+
+		imgui_io.MouseDrawCursor = _show_overlay && (!_should_save_screenshot || !_screenshot_save_gui);
+
+		if (const HWND hwnd = static_cast<HWND>(get_hwnd()); hwnd != nullptr)
+		{
+			POINT cursor_pos {};
+			if (::GetCursorPos(&cursor_pos) != FALSE && ::ScreenToClient(hwnd, &cursor_pos) != FALSE)
+			{
+				RECT client_rect {};
+				if (::GetClientRect(hwnd, &client_rect) != FALSE &&
+					client_rect.right > client_rect.left &&
+					client_rect.bottom > client_rect.top)
+				{
+					const float scale_x = imgui_io.DisplaySize.x / static_cast<float>(client_rect.right - client_rect.left);
+					const float scale_y = imgui_io.DisplaySize.y / static_cast<float>(client_rect.bottom - client_rect.top);
+					imgui_io.AddMousePosEvent(cursor_pos.x * scale_x, cursor_pos.y * scale_y);
+				}
+				else
+				{
+					imgui_io.AddMousePosEvent(static_cast<float>(cursor_pos.x), static_cast<float>(cursor_pos.y));
+				}
+			}
+		}
+
+		const bool left_button_down = (::GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+		const bool right_button_down = (::GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+		const bool middle_button_down = (::GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+		imgui_io.AddMouseButtonEvent(ImGuiMouseButton_Left, left_button_down);
+		imgui_io.AddMouseButtonEvent(ImGuiMouseButton_Right, right_button_down);
+		imgui_io.AddMouseButtonEvent(ImGuiMouseButton_Middle, middle_button_down);
+		if (left_button_down || right_button_down || middle_button_down)
+			_imgui_context->NavInputSource = ImGuiInputSource_Mouse;
+
+		imgui_io.AddKeyEvent(ImGuiMod_Ctrl, (::GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0);
+		imgui_io.AddKeyEvent(ImGuiMod_Shift, (::GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
+		imgui_io.AddKeyEvent(ImGuiMod_Alt, (::GetAsyncKeyState(VK_MENU) & 0x8000) != 0);
+
+		imgui_io.AddKeyEvent(ImGuiKey_Escape, (::GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0);
+		imgui_io.AddKeyEvent(ImGuiKey_Enter, (::GetAsyncKeyState(VK_RETURN) & 0x8000) != 0);
+		imgui_io.AddKeyEvent(ImGuiKey_Tab, (::GetAsyncKeyState(VK_TAB) & 0x8000) != 0);
+		imgui_io.AddKeyEvent(ImGuiKey_UpArrow, (::GetAsyncKeyState(VK_UP) & 0x8000) != 0);
+		imgui_io.AddKeyEvent(ImGuiKey_DownArrow, (::GetAsyncKeyState(VK_DOWN) & 0x8000) != 0);
+		imgui_io.AddKeyEvent(ImGuiKey_LeftArrow, (::GetAsyncKeyState(VK_LEFT) & 0x8000) != 0);
+		imgui_io.AddKeyEvent(ImGuiKey_RightArrow, (::GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0);
+	}
+#endif
 
 	if (_input_gamepad != nullptr)
 	{
@@ -1414,22 +1526,20 @@ void reshade::runtime::draw_gui()
 	if (addon_enabled)
 #endif
 #if RESHADE_ADDON
+	for (const addon_info &info : addon_loaded_info)
 	{
-		for (const addon_info &info : addon_loaded_info)
+		for (const addon_info::overlay_callback &widget : info.overlay_callbacks)
 		{
-			for (const addon_info::overlay_callback &widget : info.overlay_callbacks)
-			{
-				if (widget.title == "OSD" ? show_splash_window : !_show_overlay)
-					continue;
+			if (widget.title == "OSD" ? show_splash_window : !_show_overlay)
+				continue;
 
-				if (ImGui::Begin(widget.title.c_str(), nullptr, ImGuiWindowFlags_NoFocusOnAppearing))
-					widget.callback(this);
-				ImGui::End();
-			}
+			if (ImGui::Begin(widget.title.c_str(), nullptr, ImGuiWindowFlags_NoFocusOnAppearing))
+				widget.callback(this);
+			ImGui::End();
 		}
-
-		invoke_addon_event<addon_event::reshade_overlay>(this);
 	}
+
+	invoke_addon_event<addon_event::reshade_overlay>(this);
 #endif
 
 	if (_effects_enabled &&
@@ -5101,10 +5211,20 @@ bool reshade::runtime::open_overlay(bool open, api::input_source source)
 {
 #if RESHADE_ADDON
 	if (invoke_addon_event<addon_event::reshade_open_overlay>(this, open, source))
+	{
+		log::message(log::level::warning,
+			"Overlay state change vetoed by add-on (requested_open=%s, source=%u).",
+			open ? "true" : "false",
+			static_cast<unsigned int>(source));
 		return false;
+	}
 #endif
 
 	_show_overlay = open;
+	log::message(log::level::info,
+		"Overlay state changed (open=%s, source=%u).",
+		open ? "true" : "false",
+		static_cast<unsigned int>(source));
 
 	if (open)
 		_imgui_context->NavInputSource = static_cast<ImGuiInputSource>(source);

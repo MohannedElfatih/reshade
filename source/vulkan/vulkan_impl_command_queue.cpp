@@ -68,7 +68,13 @@ reshade::api::command_queue_type reshade::vulkan::command_queue_impl::get_type()
 
 void reshade::vulkan::command_queue_impl::wait_idle() const
 {
-	flush_immediate_command_list();
+	const std::unique_lock<std::recursive_mutex> lock(_mutex);
+
+	if (_immediate_cmd_list != nullptr)
+	{
+		VkSubmitInfo empty_semaphore_info { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+		_immediate_cmd_list->flush(empty_semaphore_info);
+	}
 
 	vk.QueueWaitIdle(_orig);
 }
@@ -80,6 +86,8 @@ void reshade::vulkan::command_queue_impl::flush_immediate_command_list() const
 }
 void reshade::vulkan::command_queue_impl::flush_immediate_command_list(VkSubmitInfo &semaphore_info) const
 {
+	const std::unique_lock<std::recursive_mutex> lock(_mutex);
+
 	if (_immediate_cmd_list != nullptr)
 		_immediate_cmd_list->flush(semaphore_info);
 }

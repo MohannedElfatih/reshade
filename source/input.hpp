@@ -95,10 +95,16 @@ namespace reshade
 		static bool is_blocking_any_mouse_cursor_warping();
 
 		/// <summary>
+		/// Enables a fallback global input-capture mode used when Streamline FG is active and no input manager instance exists.
+		/// </summary>
+		static void set_streamline_fg_overlay_capture(bool enable);
+
+		/// <summary>
 		/// Locks access to the input data so it cannot be modified in another thread.
 		/// </summary>
 		/// <returns>RAII object holding the lock, which releases it after going out of scope.</returns>
 		auto lock() { return std::unique_lock<std::recursive_mutex>(_mutex); }
+		auto try_lock() { return std::unique_lock<std::recursive_mutex>(_mutex, std::try_to_lock); }
 
 		/// <summary>
 		/// Notifies the input manager to advance a frame.
