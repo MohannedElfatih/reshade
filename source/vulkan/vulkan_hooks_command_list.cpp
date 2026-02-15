@@ -932,7 +932,7 @@ void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage, 
 				static_cast<uint32_t>(region.dstOffsets[0].z),
 				static_cast<uint32_t>(region.dstOffsets[1].x),
 				static_cast<uint32_t>(region.dstOffsets[1].y),
-				dst_is_3d ? static_cast<uint32_t>(region.dstOffsets[1].z) + static_cast<uint32_t>(region.dstOffsets[0].z) : region.dstSubresource.layerCount,
+				dst_is_3d ? static_cast<uint32_t>(region.dstOffsets[1].z) : static_cast<uint32_t>(region.dstOffsets[0].z) + region.dstSubresource.layerCount,
 			};
 
 			if (reshade::invoke_addon_event<reshade::addon_event::copy_texture_region>(
@@ -958,6 +958,8 @@ void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer s
 	if (reshade::has_addon_event<reshade::addon_event::copy_buffer_to_texture>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		const auto dst_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>(dstImage);
+		const bool dst_is_3d = dst_data != nullptr && dst_data->create_info.imageType == VK_IMAGE_TYPE_3D;
 
 		for (uint32_t i = 0; i < regionCount; ++i)
 		{
@@ -969,7 +971,7 @@ void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer s
 				static_cast<uint32_t>(region.imageOffset.z),
 				static_cast<uint32_t>(region.imageOffset.x + region.imageExtent.width),
 				static_cast<uint32_t>(region.imageOffset.y + region.imageExtent.height),
-				static_cast<uint32_t>(region.imageOffset.z + region.imageExtent.depth) + region.imageSubresource.layerCount
+				static_cast<uint32_t>(region.imageOffset.z) + (dst_is_3d ? region.imageExtent.depth : region.imageSubresource.layerCount)
 			};
 
 			if (reshade::invoke_addon_event<reshade::addon_event::copy_buffer_to_texture>(
@@ -994,6 +996,8 @@ void VKAPI_CALL vkCmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage sr
 	if (reshade::has_addon_event<reshade::addon_event::copy_texture_to_buffer>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		const auto src_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>(srcImage);
+		const bool src_is_3d = src_data != nullptr && src_data->create_info.imageType == VK_IMAGE_TYPE_3D;
 
 		for (uint32_t i = 0; i < regionCount; ++i)
 		{
@@ -1005,7 +1009,7 @@ void VKAPI_CALL vkCmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage sr
 				static_cast<uint32_t>(region.imageOffset.z),
 				static_cast<uint32_t>(region.imageOffset.x + region.imageExtent.width),
 				static_cast<uint32_t>(region.imageOffset.y + region.imageExtent.height),
-				static_cast<uint32_t>(region.imageOffset.z + region.imageExtent.depth) + region.imageSubresource.layerCount
+				static_cast<uint32_t>(region.imageOffset.z) + (src_is_3d ? region.imageExtent.depth : region.imageSubresource.layerCount)
 			};
 
 			if (reshade::invoke_addon_event<reshade::addon_event::copy_texture_to_buffer>(
@@ -1208,6 +1212,8 @@ void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImag
 	if (reshade::has_addon_event<reshade::addon_event::resolve_texture_region>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		const auto src_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>(srcImage);
+		const bool src_is_3d = src_data != nullptr && src_data->create_info.imageType == VK_IMAGE_TYPE_3D;
 
 		for (uint32_t i = 0; i < regionCount; ++i)
 		{
@@ -1219,7 +1225,7 @@ void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImag
 				static_cast<uint32_t>(region.srcOffset.z),
 				static_cast<uint32_t>(region.srcOffset.x + region.extent.width),
 				static_cast<uint32_t>(region.srcOffset.y + region.extent.height),
-				static_cast<uint32_t>(region.srcOffset.z + region.extent.depth) + region.srcSubresource.layerCount
+				static_cast<uint32_t>(region.srcOffset.z) + (src_is_3d ? region.extent.depth : region.srcSubresource.layerCount)
 			};
 
 			if (reshade::invoke_addon_event<reshade::addon_event::resolve_texture_region>(
@@ -2114,6 +2120,8 @@ void VKAPI_CALL vkCmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkC
 	if (reshade::has_addon_event<reshade::addon_event::copy_buffer_to_texture>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		const auto dst_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>(pCopyBufferToImageInfo->dstImage);
+		const bool dst_is_3d = dst_data != nullptr && dst_data->create_info.imageType == VK_IMAGE_TYPE_3D;
 
 		for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; ++i)
 		{
@@ -2125,7 +2133,7 @@ void VKAPI_CALL vkCmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkC
 				static_cast<uint32_t>(region.imageOffset.z),
 				static_cast<uint32_t>(region.imageOffset.x + region.imageExtent.width),
 				static_cast<uint32_t>(region.imageOffset.y + region.imageExtent.height),
-				static_cast<uint32_t>(region.imageOffset.z + region.imageExtent.depth) + region.imageSubresource.layerCount
+				static_cast<uint32_t>(region.imageOffset.z) + (dst_is_3d ? region.imageExtent.depth : region.imageSubresource.layerCount)
 			};
 
 			if (reshade::invoke_addon_event<reshade::addon_event::copy_buffer_to_texture>(
@@ -2154,6 +2162,8 @@ void VKAPI_CALL vkCmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkC
 	if (reshade::has_addon_event<reshade::addon_event::copy_texture_to_buffer>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		const auto src_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>(pCopyImageToBufferInfo->srcImage);
+		const bool src_is_3d = src_data != nullptr && src_data->create_info.imageType == VK_IMAGE_TYPE_3D;
 
 		for (uint32_t i = 0; i < pCopyImageToBufferInfo->regionCount; ++i)
 		{
@@ -2165,7 +2175,7 @@ void VKAPI_CALL vkCmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkC
 				static_cast<uint32_t>(region.imageOffset.z),
 				static_cast<uint32_t>(region.imageOffset.x + region.imageExtent.width),
 				static_cast<uint32_t>(region.imageOffset.y + region.imageExtent.height),
-				static_cast<uint32_t>(region.imageOffset.z + region.imageExtent.depth) + region.imageSubresource.layerCount
+				static_cast<uint32_t>(region.imageOffset.z) + (src_is_3d ? region.imageExtent.depth : region.imageSubresource.layerCount)
 			};
 
 			if (reshade::invoke_addon_event<reshade::addon_event::copy_texture_to_buffer>(
@@ -2249,6 +2259,8 @@ void VKAPI_CALL vkCmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolv
 	if (reshade::has_addon_event<reshade::addon_event::resolve_texture_region>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		const auto src_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>(pResolveImageInfo->srcImage);
+		const bool src_is_3d = src_data != nullptr && src_data->create_info.imageType == VK_IMAGE_TYPE_3D;
 
 		for (uint32_t i = 0; i < pResolveImageInfo->regionCount; ++i)
 		{
@@ -2260,7 +2272,7 @@ void VKAPI_CALL vkCmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolv
 				static_cast<uint32_t>(region.srcOffset.z),
 				static_cast<uint32_t>(region.srcOffset.x + region.extent.width),
 				static_cast<uint32_t>(region.srcOffset.y + region.extent.height),
-				static_cast<uint32_t>(region.srcOffset.z + region.extent.depth) + region.srcSubresource.layerCount
+				static_cast<uint32_t>(region.srcOffset.z) + (src_is_3d ? region.extent.depth : region.srcSubresource.layerCount)
 			};
 
 			if (reshade::invoke_addon_event<reshade::addon_event::resolve_texture_region>(
