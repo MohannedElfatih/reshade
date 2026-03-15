@@ -1340,3 +1340,4 @@ void reshade::vulkan::command_list_impl::insert_debug_marker(const char *label, 
 	vk.CmdInsertDebugUtilsLabelEXT(_orig, &label_info);
 #endif
 }
+

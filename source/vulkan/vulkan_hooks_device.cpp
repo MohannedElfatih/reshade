@@ -16,6 +16,7 @@
 #include "lockfree_linear_map.hpp"
 #include <cstring> // std::strcmp, std::strncmp
 #include <algorithm> // std::find_if, std::min
+#include <mutex>
 
 // Set during Vulkan device creation and presentation, to avoid hooking internal D3D devices created e.g. by NVIDIA Ansel, Optimus or layered DXGI swapchain
 extern thread_local bool g_in_dxgi_runtime;
@@ -171,6 +172,7 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 	bool extended_dynamic_state_ext = false;
 	bool push_descriptor_ext = false;
 	bool host_image_copy_ext = false;
+	bool unified_image_layouts_ext = false;
 	bool custom_border_color_ext = false;
 	bool conservative_rasterization_ext = false;
 	bool ray_tracing_ext = false;
@@ -242,6 +244,10 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 			if (!add_extension(VK_EXT_PRIVATE_DATA_EXTENSION_NAME, true))
 #endif
 				return VK_ERROR_EXTENSION_NOT_PRESENT;
+
+#if VK_KHR_shader_non_semantic_info
+			add_extension(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME, false);
+#endif
 		}
 
 		if (instance.api_version < VK_API_VERSION_1_4)
@@ -257,6 +263,9 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 				add_extension(VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME, false);
 #endif
 		}
+#if VK_KHR_unified_image_layouts
+		unified_image_layouts_ext = add_extension(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME, false);
+#endif
 
 #if VK_KHR_external_memory_win32
 		add_extension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, false);
@@ -427,6 +436,7 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 	}
 
 	VkPhysicalDeviceHostImageCopyFeatures host_image_copy_features;
+	VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified_image_layouts_features;
 	if (const auto existing_vulkan_14_features = find_in_structure_chain<VkPhysicalDeviceVulkan14Features>(
 			pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES))
 	{
@@ -449,6 +459,19 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 
 			create_info.pNext = &host_image_copy_features;
 		}
+	}
+
+	if (const auto existing_unified_image_layouts_features = find_in_structure_chain<VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR>(
+			pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR))
+	{
+		unified_image_layouts_ext = existing_unified_image_layouts_features->unifiedImageLayouts;
+	}
+	else if (unified_image_layouts_ext)
+	{
+		unified_image_layouts_features = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR, const_cast<void *>(create_info.pNext) };
+		unified_image_layouts_features.unifiedImageLayouts = VK_TRUE;
+
+		create_info.pNext = &unified_image_layouts_features;
 	}
 
 	// Enable Vulkan memory model device scope if it is not, since it is required by atomics in generated SPIR-V code for effects
@@ -833,44 +856,6 @@ inline bool ShouldUpgradeFormat(VkFormat fmt)
 	return false;
 }
 
-static void ModifyAttachments(VkRenderPassCreateInfo* createInfo)
-{
-	if (!createInfo || createInfo->attachmentCount == 0)
-		return;
-
-	// Track which attachments are specifically used as Color Render Targets
-	std::vector<bool> isColorRT(createInfo->attachmentCount, false);
-
-	for (uint32_t i = 0; i < createInfo->subpassCount; i++)
-	{
-		const VkSubpassDescription& subpass = createInfo->pSubpasses[i];
-
-		// Mark attachments used in the color role
-		for (uint32_t j = 0; j < subpass.colorAttachmentCount; j++)
-		{
-			uint32_t idx = subpass.pColorAttachments[j].attachment;
-			if (idx != VK_ATTACHMENT_UNUSED)
-			{
-				isColorRT[idx] = true;
-			}
-		}
-
-		// Note: We ignore subpass.pDepthStencilAttachment here
-		// to ensure depth-stencil textures are not upgraded.
-	}
-
-	auto* attachments = const_cast<VkAttachmentDescription*>(createInfo->pAttachments);
-
-	for (uint32_t i = 0; i < createInfo->attachmentCount; i++)
-	{
-		// Only upgrade if it's a Color RT and matches your upgrade list
-		if (isColorRT[i] && ShouldUpgradeFormat(attachments[i].format))
-		{
-			attachments[i].format = target_hdr_format;
-		}
-	}
-}
-
 VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubmits, VkFence fence)
 {
 	assert(pSubmits != nullptr || submitCount == 0);
@@ -1148,13 +1133,6 @@ VkResult VKAPI_CALL vkCreateBuffer(VkDevice device, const VkBufferCreateInfo *pC
 		pCreateInfo = &create_info;
 	}
 
-	if (reshade::api::resource override_resource = {};
-		reshade::invoke_addon_event<reshade::addon_event::override_resource>(device_impl, desc, nullptr, reshade::api::resource_usage::undefined, override_resource) &&
-		override_resource != 0)
-	{
-		*pBuffer = (VkBuffer)override_resource.handle;
-		return VK_SUCCESS;
-	}
 #endif
 
 	const VkResult result = trampoline(device, pCreateInfo, pAllocator, pBuffer);
@@ -1170,6 +1148,7 @@ VkResult VKAPI_CALL vkCreateBuffer(VkDevice device, const VkBufferCreateInfo *pC
 	reshade::vulkan::object_data<VK_OBJECT_TYPE_BUFFER> &data = *device_impl->register_object<VK_OBJECT_TYPE_BUFFER>(*pBuffer);
 	data.create_info = create_info;
 	data.create_info.pNext = nullptr; // Clear out structure chain pointer, since it becomes invalid once leaving the current scope
+
 #endif
 
 	return result;
@@ -1208,13 +1187,6 @@ VkResult VKAPI_CALL vkCreateBufferView(VkDevice device, const VkBufferViewCreate
 		pCreateInfo = &create_info;
 	}
 
-	if (reshade::api::resource_view override_resource_view = {};
-		reshade::invoke_addon_event<reshade::addon_event::override_resource_view>(device_impl, reshade::api::resource { (uint64_t)create_info.buffer }, reshade::api::resource_usage::undefined, desc, override_resource_view) &&
-		override_resource_view != 0)
-	{
-		*pView = (VkBufferView)override_resource_view.handle;
-		return VK_SUCCESS;
-	}
 #endif
 
 	const VkResult result = trampoline(device, pCreateInfo, pAllocator, pView);
@@ -1282,13 +1254,6 @@ VkResult VKAPI_CALL vkCreateImage(VkDevice device, const VkImageCreateInfo *pCre
 		}
 	}
 
-	if (reshade::api::resource override_resource = {};
-		reshade::invoke_addon_event<reshade::addon_event::override_resource>(device_impl, desc, nullptr, pCreateInfo->initialLayout == VK_IMAGE_LAYOUT_PREINITIALIZED ? reshade::api::resource_usage::cpu_access : reshade::api::resource_usage::undefined, override_resource) &&
-		override_resource != 0)
-	{
-		*pImage = (VkImage)override_resource.handle;
-		return VK_SUCCESS;
-	}
 #endif
 
 	const VkResult result = trampoline(device, pCreateInfo, pAllocator, pImage);
@@ -1304,6 +1269,7 @@ VkResult VKAPI_CALL vkCreateImage(VkDevice device, const VkImageCreateInfo *pCre
 	reshade::vulkan::object_data<VK_OBJECT_TYPE_IMAGE> &data = *device_impl->register_object<VK_OBJECT_TYPE_IMAGE>(*pImage);
 	data.create_info = create_info;
 	data.create_info.pNext = nullptr; // Clear out structure chain pointer, since it becomes invalid once leaving the current scope
+
 #endif
 
 	return result;
@@ -1353,13 +1319,6 @@ VkResult VKAPI_CALL vkCreateImageView(VkDevice device, const VkImageViewCreateIn
 		}
 	}
 
-	if (reshade::api::resource_view override_resource_view = {};
-		reshade::invoke_addon_event<reshade::addon_event::override_resource_view>(device_impl, reshade::api::resource { (uint64_t)create_info.image }, reshade::api::resource_usage::undefined, desc, override_resource_view) &&
-		override_resource_view != 0)
-	{
-		*pView = (VkImageView)override_resource_view.handle;
-		return VK_SUCCESS;
-	}
 #endif
 
 	const VkResult result = trampoline(device, pCreateInfo, pAllocator, pView);
@@ -1443,6 +1402,243 @@ void     VKAPI_CALL vkDestroyShaderModule(VkDevice device, VkShaderModule shader
 #endif
 
 	trampoline(device, shaderModule, pAllocator);
+}
+
+static void capture_graphics_pipeline_create_info(
+	reshade::vulkan::device_impl *device_impl,
+	reshade::vulkan::object_data<VK_OBJECT_TYPE_PIPELINE> &data,
+	const VkGraphicsPipelineCreateInfo &create_info)
+{
+	data.is_graphics = true;
+	data.captured_ci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+	data.captured_ci.flags = create_info.flags;
+	data.captured_ci.stageCount = create_info.stageCount;
+	data.captured_ci.layout = create_info.layout;
+	data.captured_ci.renderPass = create_info.renderPass;
+	data.captured_ci.subpass = create_info.subpass;
+	data.captured_ci.basePipelineHandle = create_info.basePipelineHandle;
+	data.captured_ci.basePipelineIndex = create_info.basePipelineIndex;
+
+	data.signature = {};
+	data.signature.samples = (create_info.pMultisampleState != nullptr) ? create_info.pMultisampleState->rasterizationSamples : VK_SAMPLE_COUNT_1_BIT;
+
+	if (create_info.renderPass != VK_NULL_HANDLE)
+	{
+		const auto render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(create_info.renderPass);
+		if (render_pass_data != nullptr && create_info.subpass < render_pass_data->subpasses.size())
+		{
+			const reshade::vulkan::object_data<VK_OBJECT_TYPE_RENDER_PASS>::subpass &subpass = render_pass_data->subpasses[create_info.subpass];
+			data.signature.color_count = std::min(subpass.num_color_attachments, 8u);
+			for (uint32_t i = 0; i < data.signature.color_count; ++i)
+			{
+				const uint32_t a = subpass.color_attachments[i];
+				if (a != VK_ATTACHMENT_UNUSED && a < render_pass_data->attachments.size())
+					data.signature.color_formats[i] = render_pass_data->attachments[a].format;
+			}
+
+			const uint32_t ds = subpass.depth_stencil_attachment;
+			if (ds != VK_ATTACHMENT_UNUSED && ds < render_pass_data->attachments.size())
+			{
+				const VkFormat ds_format = render_pass_data->attachments[ds].format;
+				if ((reshade::vulkan::aspect_flags_from_format(ds_format) & VK_IMAGE_ASPECT_DEPTH_BIT) != 0)
+					data.signature.depth_format = ds_format;
+				if ((reshade::vulkan::aspect_flags_from_format(ds_format) & VK_IMAGE_ASPECT_STENCIL_BIT) != 0)
+					data.signature.stencil_format = ds_format;
+			}
+		}
+	}
+	else if (const auto rendering_info = find_in_structure_chain<VkPipelineRenderingCreateInfo>(
+		create_info.pNext, VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO))
+	{
+		data.signature.color_count = std::min(rendering_info->colorAttachmentCount, 8u);
+		for (uint32_t i = 0; i < data.signature.color_count; ++i)
+			data.signature.color_formats[i] = rendering_info->pColorAttachmentFormats[i];
+
+		data.signature.depth_format = rendering_info->depthAttachmentFormat;
+		data.signature.stencil_format = rendering_info->stencilAttachmentFormat;
+	}
+
+	data.owned_stages.resize(create_info.stageCount);
+	data.stages.resize(create_info.stageCount);
+	for (uint32_t i = 0; i < create_info.stageCount; ++i)
+	{
+		const VkPipelineShaderStageCreateInfo &src = create_info.pStages[i];
+		auto &owned = data.owned_stages[i];
+
+		owned.ci = src;
+		owned.ci.pNext = nullptr;
+
+		if (src.pName != nullptr)
+			owned.entry_name = src.pName;
+		else
+			owned.entry_name = "main";
+		owned.ci.pName = owned.entry_name.c_str();
+
+		if (src.pSpecializationInfo != nullptr)
+		{
+			owned.spec_entries.assign(
+				src.pSpecializationInfo->pMapEntries,
+				src.pSpecializationInfo->pMapEntries + src.pSpecializationInfo->mapEntryCount);
+			owned.spec_data.resize(src.pSpecializationInfo->dataSize);
+			if (src.pSpecializationInfo->dataSize != 0 && src.pSpecializationInfo->pData != nullptr)
+				std::memcpy(owned.spec_data.data(), src.pSpecializationInfo->pData, src.pSpecializationInfo->dataSize);
+
+			owned.spec_info.mapEntryCount = static_cast<uint32_t>(owned.spec_entries.size());
+			owned.spec_info.pMapEntries = owned.spec_entries.empty() ? nullptr : owned.spec_entries.data();
+			owned.spec_info.dataSize = owned.spec_data.size();
+			owned.spec_info.pData = owned.spec_data.empty() ? nullptr : owned.spec_data.data();
+			owned.ci.pSpecializationInfo = &owned.spec_info;
+		}
+		else
+		{
+			owned.ci.pSpecializationInfo = nullptr;
+		}
+
+		data.stages[i] = owned.ci;
+	}
+	data.captured_ci.pStages = data.stages.empty() ? nullptr : data.stages.data();
+
+	if (create_info.pVertexInputState != nullptr)
+	{
+		data.vertex_input = *create_info.pVertexInputState;
+		data.vertex_input.pNext = nullptr;
+		if (create_info.pVertexInputState->vertexBindingDescriptionCount != 0 && create_info.pVertexInputState->pVertexBindingDescriptions != nullptr)
+			data.vi_bindings.assign(create_info.pVertexInputState->pVertexBindingDescriptions, create_info.pVertexInputState->pVertexBindingDescriptions + create_info.pVertexInputState->vertexBindingDescriptionCount);
+		else
+			data.vi_bindings.clear();
+		if (create_info.pVertexInputState->vertexAttributeDescriptionCount != 0 && create_info.pVertexInputState->pVertexAttributeDescriptions != nullptr)
+			data.vi_attribs.assign(create_info.pVertexInputState->pVertexAttributeDescriptions, create_info.pVertexInputState->pVertexAttributeDescriptions + create_info.pVertexInputState->vertexAttributeDescriptionCount);
+		else
+			data.vi_attribs.clear();
+		data.vertex_input.pVertexBindingDescriptions = data.vi_bindings.empty() ? nullptr : data.vi_bindings.data();
+		data.vertex_input.pVertexAttributeDescriptions = data.vi_attribs.empty() ? nullptr : data.vi_attribs.data();
+		data.captured_ci.pVertexInputState = &data.vertex_input;
+	}
+	else
+	{
+		data.captured_ci.pVertexInputState = nullptr;
+	}
+
+	if (create_info.pInputAssemblyState != nullptr)
+	{
+		data.input_assembly = *create_info.pInputAssemblyState;
+		data.input_assembly.pNext = nullptr;
+		data.captured_ci.pInputAssemblyState = &data.input_assembly;
+	}
+	else
+	{
+		data.captured_ci.pInputAssemblyState = nullptr;
+	}
+
+	if (create_info.pTessellationState != nullptr)
+	{
+		data.tessellation = *create_info.pTessellationState;
+		data.tessellation.pNext = nullptr;
+		data.captured_ci.pTessellationState = &data.tessellation;
+	}
+	else
+	{
+		data.captured_ci.pTessellationState = nullptr;
+	}
+
+	if (create_info.pViewportState != nullptr)
+	{
+		data.viewport = *create_info.pViewportState;
+		data.viewport.pNext = nullptr;
+
+		if (create_info.pViewportState->pViewports != nullptr)
+			data.viewports.assign(create_info.pViewportState->pViewports, create_info.pViewportState->pViewports + create_info.pViewportState->viewportCount);
+		else
+			data.viewports.clear();
+		if (create_info.pViewportState->pScissors != nullptr)
+			data.scissors.assign(create_info.pViewportState->pScissors, create_info.pViewportState->pScissors + create_info.pViewportState->scissorCount);
+		else
+			data.scissors.clear();
+
+		data.viewport.pViewports = data.viewports.empty() ? nullptr : data.viewports.data();
+		data.viewport.pScissors = data.scissors.empty() ? nullptr : data.scissors.data();
+		data.captured_ci.pViewportState = &data.viewport;
+	}
+	else
+	{
+		data.captured_ci.pViewportState = nullptr;
+	}
+
+	if (create_info.pRasterizationState != nullptr)
+	{
+		data.raster = *create_info.pRasterizationState;
+		data.raster.pNext = nullptr;
+		data.captured_ci.pRasterizationState = &data.raster;
+	}
+	else
+	{
+		data.captured_ci.pRasterizationState = nullptr;
+	}
+
+	if (create_info.pMultisampleState != nullptr)
+	{
+		data.msaa = *create_info.pMultisampleState;
+		data.msaa.pNext = nullptr;
+		if (create_info.pMultisampleState->pSampleMask != nullptr)
+		{
+			const uint32_t mask_count = (static_cast<uint32_t>(create_info.pMultisampleState->rasterizationSamples) + 31) / 32;
+			data.sample_masks.assign(create_info.pMultisampleState->pSampleMask, create_info.pMultisampleState->pSampleMask + mask_count);
+			data.msaa.pSampleMask = data.sample_masks.data();
+		}
+		else
+		{
+			data.sample_masks.clear();
+			data.msaa.pSampleMask = nullptr;
+		}
+		data.captured_ci.pMultisampleState = &data.msaa;
+	}
+	else
+	{
+		data.captured_ci.pMultisampleState = nullptr;
+	}
+
+	if (create_info.pDepthStencilState != nullptr)
+	{
+		data.depth_stencil = *create_info.pDepthStencilState;
+		data.depth_stencil.pNext = nullptr;
+		data.captured_ci.pDepthStencilState = &data.depth_stencil;
+	}
+	else
+	{
+		data.captured_ci.pDepthStencilState = nullptr;
+	}
+
+	if (create_info.pColorBlendState != nullptr)
+	{
+		data.blend = *create_info.pColorBlendState;
+		data.blend.pNext = nullptr;
+		if (create_info.pColorBlendState->attachmentCount != 0 && create_info.pColorBlendState->pAttachments != nullptr)
+			data.blend_attachments.assign(create_info.pColorBlendState->pAttachments, create_info.pColorBlendState->pAttachments + create_info.pColorBlendState->attachmentCount);
+		else
+			data.blend_attachments.clear();
+		data.blend.pAttachments = data.blend_attachments.empty() ? nullptr : data.blend_attachments.data();
+		data.captured_ci.pColorBlendState = &data.blend;
+	}
+	else
+	{
+		data.captured_ci.pColorBlendState = nullptr;
+	}
+
+	if (create_info.pDynamicState != nullptr)
+	{
+		data.dynamic = *create_info.pDynamicState;
+		data.dynamic.pNext = nullptr;
+		if (create_info.pDynamicState->dynamicStateCount != 0 && create_info.pDynamicState->pDynamicStates != nullptr)
+			data.dynamic_states.assign(create_info.pDynamicState->pDynamicStates, create_info.pDynamicState->pDynamicStates + create_info.pDynamicState->dynamicStateCount);
+		else
+			data.dynamic_states.clear();
+		data.dynamic.pDynamicStates = data.dynamic_states.empty() ? nullptr : data.dynamic_states.data();
+		data.captured_ci.pDynamicState = &data.dynamic;
+	}
+	else
+	{
+		data.captured_ci.pDynamicState = nullptr;
+	}
 }
 
 VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount, const VkGraphicsPipelineCreateInfo *pCreateInfos, const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines)
@@ -1684,12 +1880,6 @@ VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache p
 			result = device_impl->create_pipeline(
 				reshade::api::pipeline_layout { (uint64_t)create_info.layout }, static_cast<uint32_t>(subobjects.size()), subobjects.data(), reinterpret_cast<reshade::api::pipeline *>(&pPipelines[i])) ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
 		}
-		else if (reshade::api::pipeline override_pipeline = {};
-			reshade::invoke_addon_event<reshade::addon_event::override_pipeline>(device_impl, reshade::api::pipeline_layout { (uint64_t)create_info.layout }, static_cast<uint32_t>(subobjects.size()), subobjects.data(), override_pipeline))
-		{
-			pPipelines[i] = (VkPipeline)override_pipeline.handle;
-			result = VK_SUCCESS;
-		}
 		else
 		{
 			result = trampoline(device, pipelineCache, 1, &create_info, pAllocator, &pPipelines[i]);
@@ -1697,6 +1887,9 @@ VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache p
 
 		if (result >= VK_SUCCESS)
 		{
+			reshade::vulkan::object_data<VK_OBJECT_TYPE_PIPELINE> &pipeline_data = *device_impl->register_object<VK_OBJECT_TYPE_PIPELINE>(pPipelines[i]);
+			capture_graphics_pipeline_create_info(device_impl, pipeline_data, create_info);
+
 			reshade::invoke_addon_event<reshade::addon_event::init_pipeline>(
 				device_impl, reshade::api::pipeline_layout { (uint64_t)create_info.layout }, static_cast<uint32_t>(subobjects.size()), subobjects.data(), reshade::api::pipeline { (uint64_t)pPipelines[i] });
 		}
@@ -1770,12 +1963,6 @@ VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice device, VkPipelineCache pi
 		{
 			result = device_impl->create_pipeline(
 				reshade::api::pipeline_layout { (uint64_t)create_info.layout }, static_cast<uint32_t>(std::size(subobjects)), subobjects, reinterpret_cast<reshade::api::pipeline *>(&pPipelines[i])) ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
-		}
-		else if (reshade::api::pipeline override_pipeline = {};
-			reshade::invoke_addon_event<reshade::addon_event::override_pipeline>(device_impl, reshade::api::pipeline_layout { (uint64_t)create_info.layout }, static_cast<uint32_t>(std::size(subobjects)), subobjects, override_pipeline))
-		{
-			pPipelines[i] = (VkPipeline)override_pipeline.handle;
-			result = VK_SUCCESS;
 		}
 		else
 		{
@@ -1969,12 +2156,6 @@ VkResult VKAPI_CALL vkCreateRayTracingPipelinesKHR(VkDevice device, VkDeferredOp
 			result = device_impl->create_pipeline(
 				reshade::api::pipeline_layout { (uint64_t)create_info.layout }, static_cast<uint32_t>(subobjects.size()), subobjects.data(), reinterpret_cast<reshade::api::pipeline *>(&pPipelines[i])) ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
 		}
-		else if (reshade::api::pipeline override_pipeline = {};
-			reshade::invoke_addon_event<reshade::addon_event::override_pipeline>(device_impl, reshade::api::pipeline_layout { (uint64_t)create_info.layout }, static_cast<uint32_t>(subobjects.size()), subobjects.data(), override_pipeline))
-		{
-			pPipelines[i] = (VkPipeline)override_pipeline.handle;
-			result = VK_SUCCESS;
-		}
 		else
 		{
 			result = trampoline(device, deferredOperation, pipelineCache, 1, &create_info, pAllocator, &pPipelines[i]);
@@ -2036,11 +2217,33 @@ void     VKAPI_CALL vkDestroyPipeline(VkDevice device, VkPipeline pipeline, cons
 			pd->dynamic_rendering_signatures.clear();
 		}
 	}
+	if (pd != nullptr)
+	{
+		const std::lock_guard<std::mutex> lock(*pd->render_pass_clone_mutex);
+		if (!pd->render_pass_clones.empty())
+		{
+			for (VkPipeline clone : pd->render_pass_clones)
+			{
+				device_impl->_dispatch_table.DestroyPipeline(
+					device_impl->_orig,
+					clone,
+					pAllocator);
+			}
+
+#if RESHADE_VERBOSE_LOG
+			reshade::log::message(reshade::log::level::info, "Destroy cloned render pass pipelines for VkPipeline %p.", reinterpret_cast<void *>(pipeline));
+#endif
+			pd->render_pass_clones.clear();
+			pd->render_pass_clone_targets.clear();
+		}
+	}
 
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(DestroyPipeline, device_impl);
 
 #if RESHADE_ADDON >= 2
 	reshade::invoke_addon_event<reshade::addon_event::destroy_pipeline>(device_impl, reshade::api::pipeline { (uint64_t)pipeline });
+	if (pd != nullptr)
+		device_impl->unregister_object<VK_OBJECT_TYPE_PIPELINE>(pipeline);
 #endif
 
 	trampoline(device, pipeline, pAllocator);
@@ -2610,6 +2813,32 @@ void     VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevice device, VkDescrip
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(device));
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(UpdateDescriptorSetWithTemplate, device_impl);
 
+	const auto descriptor_payload_size = [](VkDescriptorType type) {
+		switch (type)
+		{
+		case VK_DESCRIPTOR_TYPE_SAMPLER:
+		case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+		case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+		case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+		case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+			return sizeof(VkDescriptorImageInfo);
+		case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+		case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+			return sizeof(VkBufferView);
+		case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+		case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+			return sizeof(VkDescriptorBufferInfo);
+#if VK_KHR_acceleration_structure
+		case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+			return sizeof(VkAccelerationStructureKHR);
+#endif
+		default:
+			return sizeof(uint64_t);
+		}
+	};
+
 #if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::update_descriptor_tables>())
 	{
@@ -2681,6 +2910,158 @@ void     VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevice device, VkDescrip
 	trampoline(device, descriptorSet, descriptorUpdateTemplate, pData);
 }
 
+VkRenderPass create_cloned_render_pass_for_framebuffer(
+	reshade::vulkan::device_impl *device_impl,
+	VkRenderPass render_pass,
+	uint32_t attachment_count,
+	const VkImageView *attachments,
+	const VkAllocationCallbacks *allocator)
+{
+	const auto render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(render_pass);
+	if (render_pass_data == nullptr)
+		return VK_NULL_HANDLE;
+
+	const VkRenderPass original_render_pass =
+		(render_pass_data->original_render_pass != VK_NULL_HANDLE) ? render_pass_data->original_render_pass : render_pass;
+	auto *original_render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(original_render_pass);
+	if (original_render_pass_data == nullptr)
+		original_render_pass_data = render_pass_data;
+
+	if (attachment_count == 0 || attachments == nullptr || original_render_pass_data->attachments.empty() || original_render_pass_data->subpasses.empty())
+		return VK_NULL_HANDLE;
+
+	std::vector<VkFormat> format_key;
+	format_key.reserve(original_render_pass_data->attachments.size());
+	for (const VkAttachmentDescription &attachment : original_render_pass_data->attachments)
+		format_key.push_back(attachment.format);
+
+	std::vector<VkAttachmentDescription> cloned_attachments = original_render_pass_data->attachments;
+	const uint32_t max_attachments = std::min<uint32_t>(attachment_count, static_cast<uint32_t>(cloned_attachments.size()));
+
+	bool has_format_mismatch = false;
+	for (uint32_t i = 0; i < max_attachments; ++i)
+	{
+		const auto view_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE_VIEW, true>(attachments[i]);
+		if (view_data == nullptr || view_data->create_info.sType != VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+			continue;
+
+		const VkFormat new_format = view_data->create_info.format;
+		if (new_format != VK_FORMAT_UNDEFINED && cloned_attachments[i].format != new_format)
+		{
+			cloned_attachments[i].format = new_format;
+			format_key[i] = new_format;
+			has_format_mismatch = true;
+		}
+	}
+
+	if (!has_format_mismatch)
+		return VK_NULL_HANDLE;
+
+	{
+		const std::lock_guard<std::mutex> lock(*original_render_pass_data->cloned_render_pass_mutex);
+		for (size_t i = 0; i < original_render_pass_data->cloned_render_pass_format_keys.size(); ++i)
+		{
+			if (original_render_pass_data->cloned_render_pass_format_keys[i] == format_key)
+			{
+#if RESHADE_VERBOSE_LOG
+				reshade::log::message(reshade::log::level::info, "Reusing cloned VkRenderPass %p for original VkRenderPass %p.", original_render_pass_data->cloned_render_passes[i], original_render_pass);
+#endif
+				return original_render_pass_data->cloned_render_passes[i];
+			}
+		}
+	}
+
+	std::vector<VkSubpassDescription> cloned_subpasses(original_render_pass_data->subpasses.size());
+	std::vector<std::vector<VkAttachmentReference>> input_attachment_storage(original_render_pass_data->subpasses.size());
+	std::vector<std::vector<VkAttachmentReference>> color_attachment_storage(original_render_pass_data->subpasses.size());
+	std::vector<std::vector<VkAttachmentReference>> resolve_attachment_storage(original_render_pass_data->subpasses.size());
+	std::vector<VkAttachmentReference> depth_attachment_storage(original_render_pass_data->subpasses.size(), { VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED });
+
+	for (size_t i = 0; i < original_render_pass_data->subpasses.size(); ++i)
+	{
+		const auto &src_subpass = original_render_pass_data->subpasses[i];
+		VkSubpassDescription &dst_subpass = cloned_subpasses[i];
+		dst_subpass = {};
+		dst_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+
+		input_attachment_storage[i].resize(src_subpass.num_input_attachments);
+		for (uint32_t a = 0; a < src_subpass.num_input_attachments; ++a)
+			input_attachment_storage[i][a] = { src_subpass.input_attachments[a], src_subpass.input_attachment_layouts[a] };
+
+		color_attachment_storage[i].resize(src_subpass.num_color_attachments);
+		resolve_attachment_storage[i].resize(src_subpass.num_color_attachments);
+		for (uint32_t a = 0; a < src_subpass.num_color_attachments; ++a)
+		{
+			color_attachment_storage[i][a] = { src_subpass.color_attachments[a], src_subpass.color_attachment_layouts[a] };
+			resolve_attachment_storage[i][a] = { src_subpass.resolve_attachments[a], src_subpass.resolve_attachment_layouts[a] };
+		}
+
+		dst_subpass.inputAttachmentCount = static_cast<uint32_t>(input_attachment_storage[i].size());
+		dst_subpass.pInputAttachments = input_attachment_storage[i].empty() ? nullptr : input_attachment_storage[i].data();
+		dst_subpass.colorAttachmentCount = static_cast<uint32_t>(color_attachment_storage[i].size());
+		dst_subpass.pColorAttachments = color_attachment_storage[i].empty() ? nullptr : color_attachment_storage[i].data();
+
+		bool has_resolve_attachment = false;
+		for (const VkAttachmentReference &resolve_attachment : resolve_attachment_storage[i])
+		{
+			if (resolve_attachment.attachment != VK_ATTACHMENT_UNUSED)
+			{
+				has_resolve_attachment = true;
+				break;
+			}
+		}
+		dst_subpass.pResolveAttachments = has_resolve_attachment ? resolve_attachment_storage[i].data() : nullptr;
+
+		if (src_subpass.depth_stencil_attachment != VK_ATTACHMENT_UNUSED)
+		{
+			depth_attachment_storage[i] = { src_subpass.depth_stencil_attachment, src_subpass.depth_stencil_attachment_layout };
+			dst_subpass.pDepthStencilAttachment = &depth_attachment_storage[i];
+		}
+	}
+
+	VkRenderPassCreateInfo cloned_create_info { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+	cloned_create_info.attachmentCount = static_cast<uint32_t>(cloned_attachments.size());
+	cloned_create_info.pAttachments = cloned_attachments.data();
+	cloned_create_info.subpassCount = static_cast<uint32_t>(cloned_subpasses.size());
+	cloned_create_info.pSubpasses = cloned_subpasses.data();
+	cloned_create_info.dependencyCount = static_cast<uint32_t>(original_render_pass_data->dependencies.size());
+	cloned_create_info.pDependencies = original_render_pass_data->dependencies.empty() ? nullptr : original_render_pass_data->dependencies.data();
+
+	VkRenderPass cloned_render_pass = VK_NULL_HANDLE;
+	if (device_impl->_dispatch_table.CreateRenderPass(device_impl->_orig, &cloned_create_info, allocator, &cloned_render_pass) != VK_SUCCESS)
+		return VK_NULL_HANDLE;
+
+#if RESHADE_ADDON
+	reshade::vulkan::object_data<VK_OBJECT_TYPE_RENDER_PASS> &cloned_data = *device_impl->register_object<VK_OBJECT_TYPE_RENDER_PASS>(cloned_render_pass);
+	cloned_data.subpasses = original_render_pass_data->subpasses;
+	cloned_data.attachments = std::move(cloned_attachments);
+	cloned_data.dependencies = original_render_pass_data->dependencies;
+	cloned_data.original_render_pass = original_render_pass;
+
+	{
+		const std::lock_guard<std::mutex> lock(*original_render_pass_data->cloned_render_pass_mutex);
+		for (size_t i = 0; i < original_render_pass_data->cloned_render_pass_format_keys.size(); ++i)
+		{
+			if (original_render_pass_data->cloned_render_pass_format_keys[i] == format_key)
+			{
+				device_impl->unregister_object<VK_OBJECT_TYPE_RENDER_PASS>(cloned_render_pass);
+				device_impl->_dispatch_table.DestroyRenderPass(device_impl->_orig, cloned_render_pass, allocator);
+				return original_render_pass_data->cloned_render_passes[i];
+			}
+		}
+
+		original_render_pass_data->cloned_render_pass_format_keys.emplace_back(std::move(format_key));
+		original_render_pass_data->cloned_render_passes.push_back(cloned_render_pass);
+	}
+#endif
+
+#if RESHADE_VERBOSE_LOG
+	// reshade::log::message(reshade::log::level::info, "Created cloned VkRenderPass %p from original VkRenderPass %p.", cloned_render_pass, render_pass);
+#endif
+
+	return cloned_render_pass;
+}
+
 VkResult VKAPI_CALL vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkFramebuffer *pFramebuffer)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(device));
@@ -2688,7 +3069,102 @@ VkResult VKAPI_CALL vkCreateFramebuffer(VkDevice device, const VkFramebufferCrea
 
 	assert(pCreateInfo != nullptr && pFramebuffer != nullptr);
 
-	const VkResult result = trampoline(device, pCreateInfo, pAllocator, pFramebuffer);
+	const VkFramebufferCreateInfo *create_info = pCreateInfo;
+	VkFramebufferCreateInfo create_info_copy = *pCreateInfo;
+	temp_mem<VkImageView, 8> attachment_storage(pCreateInfo->attachmentCount);
+
+	if ((pCreateInfo->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) == 0 &&
+		pCreateInfo->attachmentCount != 0 &&
+		pCreateInfo->pAttachments != nullptr)
+	{
+		const auto render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(pCreateInfo->renderPass);
+		std::copy_n(pCreateInfo->pAttachments, pCreateInfo->attachmentCount, attachment_storage.p);
+
+#if RESHADE_ADDON
+		if (render_pass_data != nullptr &&
+			!render_pass_data->subpasses.empty() &&
+			reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
+		{
+			const auto &subpass = render_pass_data->subpasses[0];
+			temp_mem<reshade::api::resource_view, 8> rtvs(subpass.num_color_attachments);
+			temp_mem<uint32_t, 8> color_attachment_indices(subpass.num_color_attachments);
+
+			for (uint32_t a = 0; a < subpass.num_color_attachments; ++a)
+			{
+				const uint32_t attachment_index = subpass.color_attachments[a];
+				color_attachment_indices[a] = attachment_index;
+				rtvs[a] = (attachment_index != VK_ATTACHMENT_UNUSED && attachment_index < pCreateInfo->attachmentCount) ?
+					reshade::api::resource_view { (uint64_t)attachment_storage[attachment_index] } :
+					reshade::api::resource_view {};
+			}
+
+			const uint32_t ds_attachment_index = subpass.depth_stencil_attachment;
+			reshade::api::resource_view dsv =
+				(ds_attachment_index != VK_ATTACHMENT_UNUSED && ds_attachment_index < pCreateInfo->attachmentCount) ?
+					reshade::api::resource_view { (uint64_t)attachment_storage[ds_attachment_index] } :
+					reshade::api::resource_view {};
+
+			if (const auto immediate_command_list = device_impl->get_immediate_command_list();
+				immediate_command_list != nullptr)
+			{
+				// This event is used as a mutable hook for Vulkan framebuffer attachment overrides in this path.
+				reshade::invoke_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+					immediate_command_list, subpass.num_color_attachments, static_cast<const reshade::api::resource_view *>(rtvs.p), dsv);
+			}
+
+			for (uint32_t a = 0; a < subpass.num_color_attachments; ++a)
+			{
+				const uint32_t attachment_index = color_attachment_indices[a];
+				if (attachment_index != VK_ATTACHMENT_UNUSED && attachment_index < pCreateInfo->attachmentCount)
+					attachment_storage[attachment_index] = (VkImageView)rtvs[a].handle;
+			}
+
+			if (ds_attachment_index != VK_ATTACHMENT_UNUSED && ds_attachment_index < pCreateInfo->attachmentCount)
+				attachment_storage[ds_attachment_index] = (VkImageView)dsv.handle;
+		}
+#endif
+
+		create_info_copy.pAttachments = attachment_storage.p;
+
+		if (render_pass_data != nullptr)
+		{
+			bool has_format_mismatch = false;
+			const uint32_t max_attachments = std::min<uint32_t>(create_info_copy.attachmentCount, static_cast<uint32_t>(render_pass_data->attachments.size()));
+			for (uint32_t i = 0; i < max_attachments; ++i)
+			{
+				const auto view_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE_VIEW, true>(create_info_copy.pAttachments[i]);
+				if (view_data == nullptr || view_data->create_info.sType != VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+					continue;
+
+				if (view_data->create_info.format != render_pass_data->attachments[i].format)
+				{
+					has_format_mismatch = true;
+					break;
+				}
+			}
+
+			if (has_format_mismatch)
+			{
+				VkRenderPass cloned_render_pass = create_cloned_render_pass_for_framebuffer(
+					device_impl,
+					pCreateInfo->renderPass,
+					create_info_copy.attachmentCount,
+					create_info_copy.pAttachments,
+					pAllocator);
+				if (cloned_render_pass != VK_NULL_HANDLE)
+				{
+#if RESHADE_VERBOSE_LOG
+					// reshade::log::message(reshade::log::level::info, "vkCreateFramebuffer switched VkRenderPass %p -> %p.", pCreateInfo->renderPass, cloned_render_pass);
+#endif
+					create_info_copy.renderPass = cloned_render_pass;
+				}
+			}
+		}
+
+		create_info = &create_info_copy;
+	}
+
+	const VkResult result = trampoline(device, create_info, pAllocator, pFramebuffer);
 	if (result < VK_SUCCESS)
 	{
 #if RESHADE_VERBOSE_LOG
@@ -2700,15 +3176,16 @@ VkResult VKAPI_CALL vkCreateFramebuffer(VkDevice device, const VkFramebufferCrea
 #if RESHADE_ADDON
 	// Keep track of the frame buffer attachments
 	reshade::vulkan::object_data<VK_OBJECT_TYPE_FRAMEBUFFER> &data = *device_impl->register_object<VK_OBJECT_TYPE_FRAMEBUFFER>(*pFramebuffer);
-	if ((pCreateInfo->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) != 0)
+	if ((create_info->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) != 0)
 	{
-		data.attachments.resize(pCreateInfo->attachmentCount);
+		data.attachments.resize(create_info->attachmentCount);
 	}
 	else
 	{
-		assert(pCreateInfo->pAttachments != nullptr);
-		data.attachments.assign(pCreateInfo->pAttachments, pCreateInfo->pAttachments + pCreateInfo->attachmentCount);
+		assert(create_info->pAttachments != nullptr);
+		data.attachments.assign(create_info->pAttachments, create_info->pAttachments + create_info->attachmentCount);
 	}
+	data.render_pass = create_info->renderPass;
 #endif
 
 	return result;
@@ -2755,19 +3232,50 @@ VkResult VKAPI_CALL vkCreateRenderPass(VkDevice device, const VkRenderPassCreate
 	reshade::vulkan::object_data<VK_OBJECT_TYPE_RENDER_PASS> &data = *device_impl->register_object<VK_OBJECT_TYPE_RENDER_PASS>(*pRenderPass);
 	data.subpasses.resize(pCreateInfo->subpassCount);
 	data.attachments.assign(pCreateInfo->pAttachments, pCreateInfo->pAttachments + pCreateInfo->attachmentCount);
+	if (pCreateInfo->dependencyCount != 0 && pCreateInfo->pDependencies != nullptr)
+		data.dependencies.assign(pCreateInfo->pDependencies, pCreateInfo->pDependencies + pCreateInfo->dependencyCount);
+	else
+		data.dependencies.clear();
+	data.cloned_render_pass_format_keys.clear();
+	data.cloned_render_passes.clear();
+	data.original_render_pass = *pRenderPass;
 
 	for (uint32_t i = 0; i < pCreateInfo->subpassCount; ++i)
 	{
 		reshade::vulkan::object_data<VK_OBJECT_TYPE_RENDER_PASS>::subpass &dst_subpass = data.subpasses[i];
 		const VkSubpassDescription &src_subpass = pCreateInfo->pSubpasses[i];
 
+		std::fill_n(dst_subpass.color_attachments, 8, VK_ATTACHMENT_UNUSED);
+		std::fill_n(dst_subpass.resolve_attachments, 8, VK_ATTACHMENT_UNUSED);
+		std::fill_n(dst_subpass.input_attachments, 8, VK_ATTACHMENT_UNUSED);
+		std::fill_n(dst_subpass.color_attachment_layouts, 8, VK_IMAGE_LAYOUT_UNDEFINED);
+		std::fill_n(dst_subpass.resolve_attachment_layouts, 8, VK_IMAGE_LAYOUT_UNDEFINED);
+		std::fill_n(dst_subpass.input_attachment_layouts, 8, VK_IMAGE_LAYOUT_UNDEFINED);
+
 		assert(src_subpass.colorAttachmentCount <= 8);
 		dst_subpass.num_color_attachments = std::min(src_subpass.colorAttachmentCount, 8u);
+		assert(src_subpass.inputAttachmentCount <= 8);
+		dst_subpass.num_input_attachments = std::min(src_subpass.inputAttachmentCount, 8u);
 
 		for (uint32_t a = 0; a < dst_subpass.num_color_attachments; ++a)
+		{
 			dst_subpass.color_attachments[a] = src_subpass.pColorAttachments[a].attachment;
+			dst_subpass.color_attachment_layouts[a] = src_subpass.pColorAttachments[a].layout;
+			if (src_subpass.pResolveAttachments != nullptr)
+			{
+				dst_subpass.resolve_attachments[a] = src_subpass.pResolveAttachments[a].attachment;
+				dst_subpass.resolve_attachment_layouts[a] = src_subpass.pResolveAttachments[a].layout;
+			}
+		}
+
+		for (uint32_t a = 0; a < dst_subpass.num_input_attachments; ++a)
+		{
+			dst_subpass.input_attachments[a] = src_subpass.pInputAttachments[a].attachment;
+			dst_subpass.input_attachment_layouts[a] = src_subpass.pInputAttachments[a].layout;
+		}
 
 		dst_subpass.depth_stencil_attachment = (src_subpass.pDepthStencilAttachment != nullptr) ? src_subpass.pDepthStencilAttachment->attachment : VK_ATTACHMENT_UNUSED;
+		dst_subpass.depth_stencil_attachment_layout = (src_subpass.pDepthStencilAttachment != nullptr) ? src_subpass.pDepthStencilAttachment->layout : VK_IMAGE_LAYOUT_UNDEFINED;
 	}
 #endif
 
@@ -2793,19 +3301,47 @@ VkResult VKAPI_CALL vkCreateRenderPass2(VkDevice device, const VkRenderPassCreat
 	reshade::vulkan::object_data<VK_OBJECT_TYPE_RENDER_PASS> &data = *device_impl->register_object<VK_OBJECT_TYPE_RENDER_PASS>(*pRenderPass);
 	data.subpasses.resize(pCreateInfo->subpassCount);
 	data.attachments.resize(pCreateInfo->attachmentCount);
+	data.dependencies.resize(pCreateInfo->dependencyCount);
+	data.cloned_render_pass_format_keys.clear();
+	data.cloned_render_passes.clear();
+	data.original_render_pass = *pRenderPass;
 
 	for (uint32_t i = 0; i < pCreateInfo->subpassCount; ++i)
 	{
 		reshade::vulkan::object_data<VK_OBJECT_TYPE_RENDER_PASS>::subpass &dst_subpass = data.subpasses[i];
 		const VkSubpassDescription2 &src_subpass = pCreateInfo->pSubpasses[i];
 
+		std::fill_n(dst_subpass.color_attachments, 8, VK_ATTACHMENT_UNUSED);
+		std::fill_n(dst_subpass.resolve_attachments, 8, VK_ATTACHMENT_UNUSED);
+		std::fill_n(dst_subpass.input_attachments, 8, VK_ATTACHMENT_UNUSED);
+		std::fill_n(dst_subpass.color_attachment_layouts, 8, VK_IMAGE_LAYOUT_UNDEFINED);
+		std::fill_n(dst_subpass.resolve_attachment_layouts, 8, VK_IMAGE_LAYOUT_UNDEFINED);
+		std::fill_n(dst_subpass.input_attachment_layouts, 8, VK_IMAGE_LAYOUT_UNDEFINED);
+
 		assert(src_subpass.colorAttachmentCount <= 8);
 		dst_subpass.num_color_attachments = std::min(src_subpass.colorAttachmentCount, 8u);
+		assert(src_subpass.inputAttachmentCount <= 8);
+		dst_subpass.num_input_attachments = std::min(src_subpass.inputAttachmentCount, 8u);
 
 		for (uint32_t a = 0; a < dst_subpass.num_color_attachments; ++a)
+		{
 			dst_subpass.color_attachments[a] = src_subpass.pColorAttachments[a].attachment;
+			dst_subpass.color_attachment_layouts[a] = src_subpass.pColorAttachments[a].layout;
+			if (src_subpass.pResolveAttachments != nullptr)
+			{
+				dst_subpass.resolve_attachments[a] = src_subpass.pResolveAttachments[a].attachment;
+				dst_subpass.resolve_attachment_layouts[a] = src_subpass.pResolveAttachments[a].layout;
+			}
+		}
+
+		for (uint32_t a = 0; a < dst_subpass.num_input_attachments; ++a)
+		{
+			dst_subpass.input_attachments[a] = src_subpass.pInputAttachments[a].attachment;
+			dst_subpass.input_attachment_layouts[a] = src_subpass.pInputAttachments[a].layout;
+		}
 
 		dst_subpass.depth_stencil_attachment = (src_subpass.pDepthStencilAttachment != nullptr) ? src_subpass.pDepthStencilAttachment->attachment : VK_ATTACHMENT_UNUSED;
+		dst_subpass.depth_stencil_attachment_layout = (src_subpass.pDepthStencilAttachment != nullptr) ? src_subpass.pDepthStencilAttachment->layout : VK_IMAGE_LAYOUT_UNDEFINED;
 	}
 	for (uint32_t i = 0; i < pCreateInfo->attachmentCount; ++i)
 	{
@@ -2822,6 +3358,18 @@ VkResult VKAPI_CALL vkCreateRenderPass2(VkDevice device, const VkRenderPassCreat
 		dst_attachment.initialLayout = src_attachment.initialLayout;
 		dst_attachment.finalLayout = src_attachment.finalLayout;
 	}
+	for (uint32_t i = 0; i < pCreateInfo->dependencyCount; ++i)
+	{
+		const VkSubpassDependency2 &src_dependency = pCreateInfo->pDependencies[i];
+		VkSubpassDependency &dst_dependency = data.dependencies[i];
+		dst_dependency.srcSubpass = src_dependency.srcSubpass;
+		dst_dependency.dstSubpass = src_dependency.dstSubpass;
+		dst_dependency.srcStageMask = src_dependency.srcStageMask;
+		dst_dependency.dstStageMask = src_dependency.dstStageMask;
+		dst_dependency.srcAccessMask = src_dependency.srcAccessMask;
+		dst_dependency.dstAccessMask = src_dependency.dstAccessMask;
+		dst_dependency.dependencyFlags = src_dependency.dependencyFlags;
+	}
 #endif
 
 	return result;
@@ -2835,6 +3383,23 @@ void     VKAPI_CALL vkDestroyRenderPass(VkDevice device, VkRenderPass renderPass
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(DestroyRenderPass, device_impl);
 
 #if RESHADE_ADDON
+	if (const auto data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(renderPass);
+		data != nullptr)
+	{
+		if (data->original_render_pass == renderPass)
+		{
+			const std::vector<VkRenderPass> clones = [&data]() {
+				const std::lock_guard<std::mutex> lock(*data->cloned_render_pass_mutex);
+				return data->cloned_render_passes;
+			}();
+
+			for (VkRenderPass cloned_render_pass : clones)
+			{
+				device_impl->unregister_object<VK_OBJECT_TYPE_RENDER_PASS>(cloned_render_pass);
+				trampoline(device, cloned_render_pass, pAllocator);
+			}
+		}
+	}
 	device_impl->unregister_object<VK_OBJECT_TYPE_RENDER_PASS>(renderPass);
 #endif
 
@@ -2944,3 +3509,4 @@ void     VKAPI_CALL vkDestroyAccelerationStructureKHR(VkDevice device, VkAcceler
 	trampoline(device, accelerationStructure, pAllocator);
 }
 #endif
+
