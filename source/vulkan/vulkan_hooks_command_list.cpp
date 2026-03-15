@@ -1972,20 +1972,10 @@ void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRend
 			framebuffer_data->render_pass != VK_NULL_HANDLE &&
 			framebuffer_data->render_pass != pRenderPassBegin->renderPass)
 		{
-			// If this framebuffer render pass is a clone of the begin render pass, use it directly.
-			if (const auto framebuffer_render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(framebuffer_data->render_pass);
-				framebuffer_render_pass_data != nullptr &&
-				framebuffer_render_pass_data->original_render_pass != VK_NULL_HANDLE &&
-				framebuffer_render_pass_data->original_render_pass == pRenderPassBegin->renderPass)
-			{
-				begin_info_copy = *pRenderPassBegin;
-				begin_info_copy.renderPass = framebuffer_data->render_pass;
-				pRenderPassBegin = &begin_info_copy;
-			}
-			else if (const VkImageView *const attachments = resolve_render_pass_attachments(device_impl, pRenderPassBegin);
+			if (const VkImageView *const attachments = resolve_render_pass_attachments(device_impl, pRenderPassBegin);
 				attachments != nullptr && !framebuffer_data->attachments.empty())
 			{
-				// Otherwise clone the begin render pass for the framebuffer attachments and use that clone.
+				// Clone the begin render pass for the framebuffer attachments and use that clone.
 				const VkRenderPass cloned_begin_render_pass = create_cloned_render_pass_for_framebuffer(
 					device_impl,
 					pRenderPassBegin->renderPass,
@@ -2325,20 +2315,10 @@ void VKAPI_CALL vkCmdBeginRenderPass2(VkCommandBuffer commandBuffer, const VkRen
 			framebuffer_data->render_pass != VK_NULL_HANDLE &&
 			framebuffer_data->render_pass != pRenderPassBegin->renderPass)
 		{
-			// If this framebuffer render pass is a clone of the begin render pass, use it directly.
-			if (const auto framebuffer_render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(framebuffer_data->render_pass);
-				framebuffer_render_pass_data != nullptr &&
-				framebuffer_render_pass_data->original_render_pass != VK_NULL_HANDLE &&
-				framebuffer_render_pass_data->original_render_pass == pRenderPassBegin->renderPass)
-			{
-				begin_info_copy = *pRenderPassBegin;
-				begin_info_copy.renderPass = framebuffer_data->render_pass;
-				pRenderPassBegin = &begin_info_copy;
-			}
-			else if (const VkImageView *const attachments = resolve_render_pass_attachments(device_impl, pRenderPassBegin);
+			if (const VkImageView *const attachments = resolve_render_pass_attachments(device_impl, pRenderPassBegin);
 				attachments != nullptr && !framebuffer_data->attachments.empty())
 			{
-				// Otherwise clone the begin render pass for the framebuffer attachments and use that clone.
+				// Clone the begin render pass for the framebuffer attachments and use that clone.
 				const VkRenderPass cloned_begin_render_pass = create_cloned_render_pass_for_framebuffer(
 					device_impl,
 					pRenderPassBegin->renderPass,
