@@ -101,15 +101,24 @@ namespace reshade::vulkan
 		struct subpass
 		{
 			uint32_t color_attachments[8];
+			VkImageLayout color_attachment_layouts[8];
 			uint32_t resolve_attachments[8];
+			VkImageLayout resolve_attachment_layouts[8];
 			uint32_t num_color_attachments;
 			uint32_t input_attachments[8];
+			VkImageLayout input_attachment_layouts[8];
 			uint32_t num_input_attachments;
 			uint32_t depth_stencil_attachment;
+			VkImageLayout depth_stencil_attachment_layout;
 		};
 
 		std::vector<subpass> subpasses;
 		std::vector<VkAttachmentDescription> attachments;
+		std::vector<VkSubpassDependency> dependencies;
+		std::vector<std::vector<VkFormat>> cloned_render_pass_format_keys;
+		std::vector<VkRenderPass> cloned_render_passes;
+		std::unique_ptr<std::mutex> cloned_render_pass_mutex = std::make_unique<std::mutex>();
+		VkRenderPass original_render_pass = VK_NULL_HANDLE;
 	};
 
 	template <>
@@ -118,6 +127,7 @@ namespace reshade::vulkan
 		using Handle = VkFramebuffer;
 
 		std::vector<VkImageView> attachments;
+		VkRenderPass render_pass = VK_NULL_HANDLE;
 	};
 
 	template <>
@@ -153,6 +163,9 @@ namespace reshade::vulkan
 		std::vector<rendering_signature> dynamic_rendering_signatures;
 		std::vector<VkPipeline> dynamic_rendering_pipelines;
 		std::unique_ptr<std::mutex> dynamic_rendering_mutex = std::make_unique<std::mutex>();
+		std::vector<VkRenderPass> render_pass_clone_targets;
+		std::vector<VkPipeline> render_pass_clones;
+		std::unique_ptr<std::mutex> render_pass_clone_mutex = std::make_unique<std::mutex>();
 
 		// --- NEW: capture enough to recreate the pipeline ---
 		bool is_graphics = false;
@@ -170,9 +183,12 @@ namespace reshade::vulkan
 		VkPipelineTessellationStateCreateInfo tessellation = { VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO };
 
 		VkPipelineViewportStateCreateInfo viewport = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+		std::vector<VkViewport> viewports;
+		std::vector<VkRect2D> scissors;
 
 		VkPipelineRasterizationStateCreateInfo raster = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
 		VkPipelineMultisampleStateCreateInfo msaa = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+		std::vector<VkSampleMask> sample_masks;
 		VkPipelineDepthStencilStateCreateInfo depth_stencil = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
 
 		VkPipelineColorBlendStateCreateInfo blend = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };

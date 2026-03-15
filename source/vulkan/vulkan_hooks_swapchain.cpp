@@ -227,20 +227,6 @@ VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreat
 
 	// modify_image_format_list_create_info(create_info, create_info.imageFormat);
 
-	// TODO(Ritsu): find another way to do this from addon
-	switch (create_info.imageFormat)
-	{
-	case VK_FORMAT_R16G16B16A16_SFLOAT:
-		create_info.imageColorSpace = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
-		break;
-	case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
-	case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
-		create_info.imageColorSpace = VK_COLOR_SPACE_HDR10_ST2084_EXT;
-		break;
-	default:
-		break;
-	}
-
 	desc.back_buffer_count = create_info.minImageCount;
 	desc.present_mode = static_cast<uint32_t>(create_info.presentMode);
 	desc.present_flags = create_info.flags;
@@ -298,6 +284,29 @@ VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreat
 
 		if (desc.sync_interval == 0)
 			create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+	}
+
+	if (const auto format_list_info = find_in_structure_chain<VkImageFormatListCreateInfo>(
+			create_info.pNext, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO))
+	{
+		// Remove format list info if format was overridden and the new format is not listed.
+		if (std::find(format_list_info->pViewFormats, format_list_info->pViewFormats + format_list_info->viewFormatCount, create_info.imageFormat) == (format_list_info->pViewFormats + format_list_info->viewFormatCount))
+			// This is evil, because writing into application memory, but it is what it is.
+			const_cast<VkImageFormatListCreateInfo *>(format_list_info)->viewFormatCount = 0;
+	}
+
+
+	switch (create_info.imageFormat)
+	{
+	case VK_FORMAT_R16G16B16A16_SFLOAT:
+		create_info.imageColorSpace = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
+		break;
+	case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+	case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+		create_info.imageColorSpace = VK_COLOR_SPACE_HDR10_ST2084_EXT;
+		break;
+	default:
+		break;
 	}
 #endif
 

@@ -97,15 +97,19 @@ namespace reshade::vulkan
 #if RESHADE_ADDON
 		using command_list_impl::_is_in_render_pass;
 
-		uint32_t current_subpass = std::numeric_limits<uint32_t>::max();
-		VkRenderPass current_render_pass = VK_NULL_HANDLE;
-		VkFramebuffer current_framebuffer = VK_NULL_HANDLE;
-		VkImageView current_color_attachments[8] = {};
-		VkImageView current_depth_stencil_attachment = VK_NULL_HANDLE;
+			uint32_t current_subpass = std::numeric_limits<uint32_t>::max();
+			VkRenderPass current_render_pass = VK_NULL_HANDLE;
+			VkFramebuffer current_framebuffer = VK_NULL_HANDLE;
+			VkImageView current_color_attachments[8] = {};
+			VkImageView current_resolve_attachments[8] = {};
+			bool current_color_attachment_replaced[8] = {};
+			bool current_resolve_attachment_replaced[8] = {};
+			VkImageView current_depth_stencil_attachment = VK_NULL_HANDLE;
 		uint32_t current_color_attachment_count = 0;
 		VkFormat current_color_attachment_formats[8] = {};
 		VkFormat current_depth_attachment_format = VK_FORMAT_UNDEFINED;
 		VkFormat current_stencil_attachment_format = VK_FORMAT_UNDEFINED;
+		VkSampleCountFlagBits current_rendering_samples = VK_SAMPLE_COUNT_1_BIT;
 		bool using_dynamic_rendering = false;
 		bool alpha_to_coverage_set = false;
 		bool alpha_to_one_set = false;

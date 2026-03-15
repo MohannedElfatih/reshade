@@ -1352,8 +1352,6 @@ bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, 
 		case api::pipeline_subobject_type::primitive_topology:
 			assert(subobjects[i].count == 1);
 			topology = *static_cast<const api::primitive_topology *>(subobjects[i].data);
-			if (topology == api::primitive_topology::triangle_fan)
-				goto exit_failure;
 			break;
 		case api::pipeline_subobject_type::depth_stencil_format:
 			assert(subobjects[i].count == 1);
@@ -1993,93 +1991,6 @@ exit_failure:
 void reshade::vulkan::device_impl::destroy_pipeline(api::pipeline pipeline)
 {
 	vk.DestroyPipeline(_orig, (VkPipeline)pipeline.handle, nullptr);
-}
-
-static bool compare_descriptor_range(const reshade::api::descriptor_range &lhs, const reshade::api::descriptor_range &rhs)
-{
-	return lhs.binding == rhs.binding &&
-		lhs.dx_register_index == rhs.dx_register_index &&
-		lhs.dx_register_space == rhs.dx_register_space &&
-		lhs.count == rhs.count &&
-		lhs.array_size == rhs.array_size &&
-		lhs.type == rhs.type &&
-		lhs.visibility == rhs.visibility;
-}
-
-static bool compare_static_samplers(const reshade::api::sampler_desc *lhs, const std::vector<reshade::api::sampler_desc> &rhs, uint32_t count)
-{
-	if (lhs == nullptr)
-		return rhs.empty();
-	if (rhs.size() != count)
-		return false;
-
-	for (uint32_t i = 0; i < count; ++i)
-	{
-		if (std::memcmp(&lhs[i], &rhs[i], sizeof(reshade::api::sampler_desc)) != 0)
-			return false;
-	}
-
-	return true;
-}
-
-static bool matches_descriptor_set_layout(
-	const reshade::vulkan::object_data<VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT> &data,
-	const reshade::api::descriptor_range_with_static_samplers *ranges,
-	uint32_t range_count,
-	bool push_descriptors,
-	bool with_static_samplers)
-{
-	if (data.push_descriptors != push_descriptors)
-		return false;
-
-	if (with_static_samplers)
-	{
-		if (data.ranges_with_static_samplers.size() != range_count || data.static_samplers.size() != range_count)
-			return false;
-
-		for (uint32_t i = 0; i < range_count; ++i)
-		{
-			if (!compare_descriptor_range(data.ranges_with_static_samplers[i], *static_cast<const reshade::api::descriptor_range *>(&ranges[i])))
-				return false;
-			if (!compare_static_samplers(ranges[i].static_samplers, data.static_samplers[i], ranges[i].count))
-				return false;
-		}
-
-		return true;
-	}
-
-	if (data.ranges.size() != range_count)
-		return false;
-
-	for (uint32_t i = 0; i < range_count; ++i)
-	{
-		if (!compare_descriptor_range(data.ranges[i], *static_cast<const reshade::api::descriptor_range *>(&ranges[i])))
-			return false;
-	}
-
-	return true;
-}
-
-static bool matches_descriptor_set_layout_binding_flags(
-	const reshade::vulkan::object_data<VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT> &data,
-	const std::vector<VkDescriptorBindingFlags> *binding_flags_by_binding_ptr)
-{
-	if (binding_flags_by_binding_ptr == nullptr || binding_flags_by_binding_ptr->empty())
-		return true;
-
-	const auto &flags = *binding_flags_by_binding_ptr;
-	for (size_t binding = 0; binding < flags.size(); ++binding)
-	{
-		const VkDescriptorBindingFlags expected = flags[binding];
-		if (expected == 0)
-			continue;
-		if (binding >= data.binding_flags.size())
-			return false;
-		if (data.binding_flags[binding] != expected)
-			return false;
-	}
-
-	return true;
 }
 
 void reshade::vulkan::device_impl::set_pending_set_layout_binding_flags(std::vector<std::vector<VkDescriptorBindingFlags>> &&flags)
