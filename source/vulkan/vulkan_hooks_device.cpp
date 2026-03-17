@@ -1887,11 +1887,14 @@ VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache p
 
 		if (result >= VK_SUCCESS)
 		{
-			reshade::vulkan::object_data<VK_OBJECT_TYPE_PIPELINE> &pipeline_data = *device_impl->register_object<VK_OBJECT_TYPE_PIPELINE>(pPipelines[i]);
-			capture_graphics_pipeline_create_info(device_impl, pipeline_data, create_info);
+			if (pPipelines[i] != VK_NULL_HANDLE)
+			{
+				reshade::vulkan::object_data<VK_OBJECT_TYPE_PIPELINE> &pipeline_data = *device_impl->register_object<VK_OBJECT_TYPE_PIPELINE>(pPipelines[i]);
+				capture_graphics_pipeline_create_info(device_impl, pipeline_data, create_info);
 
-			reshade::invoke_addon_event<reshade::addon_event::init_pipeline>(
-				device_impl, reshade::api::pipeline_layout { (uint64_t)create_info.layout }, static_cast<uint32_t>(subobjects.size()), subobjects.data(), reshade::api::pipeline { (uint64_t)pPipelines[i] });
+				reshade::invoke_addon_event<reshade::addon_event::init_pipeline>(
+					device_impl, reshade::api::pipeline_layout { (uint64_t)create_info.layout }, static_cast<uint32_t>(subobjects.size()), subobjects.data(), reshade::api::pipeline { (uint64_t)pPipelines[i] });
+			}
 		}
 		else
 		{
@@ -3126,46 +3129,49 @@ VkResult VKAPI_CALL vkCreateFramebuffer(VkDevice device, const VkFramebufferCrea
 			if (ds_attachment_index != VK_ATTACHMENT_UNUSED && ds_attachment_index < pCreateInfo->attachmentCount)
 				attachment_storage[ds_attachment_index] = (VkImageView)dsv.handle;
 		}
-#endif
 
-		create_info_copy.pAttachments = attachment_storage.p;
-
-		if (render_pass_data != nullptr)
+		if(reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
 		{
-			bool has_format_mismatch = false;
-			const uint32_t max_attachments = std::min<uint32_t>(create_info_copy.attachmentCount, static_cast<uint32_t>(render_pass_data->attachments.size()));
-			for (uint32_t i = 0; i < max_attachments; ++i)
-			{
-				const auto view_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE_VIEW, true>(create_info_copy.pAttachments[i]);
-				if (view_data == nullptr || view_data->create_info.sType != VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
-					continue;
+			create_info_copy.pAttachments = attachment_storage.p;
 
-				if (view_data->create_info.format != render_pass_data->attachments[i].format)
+			if (render_pass_data != nullptr)
+			{
+				bool has_format_mismatch = false;
+				const uint32_t max_attachments = std::min<uint32_t>(create_info_copy.attachmentCount, static_cast<uint32_t>(render_pass_data->attachments.size()));
+				for (uint32_t i = 0; i < max_attachments; ++i)
 				{
-					has_format_mismatch = true;
-					break;
+					const auto view_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE_VIEW, true>(create_info_copy.pAttachments[i]);
+					if (view_data == nullptr || view_data->create_info.sType != VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+						continue;
+
+					if (view_data->create_info.format != render_pass_data->attachments[i].format)
+					{
+						has_format_mismatch = true;
+						break;
+					}
 				}
-			}
 
-			if (has_format_mismatch)
-			{
-				VkRenderPass cloned_render_pass = create_cloned_render_pass_for_framebuffer(
-					device_impl,
-					pCreateInfo->renderPass,
-					create_info_copy.attachmentCount,
-					create_info_copy.pAttachments,
-					pAllocator);
-				if (cloned_render_pass != VK_NULL_HANDLE)
+				if (has_format_mismatch)
 				{
+					VkRenderPass cloned_render_pass = create_cloned_render_pass_for_framebuffer(
+						device_impl,
+						pCreateInfo->renderPass,
+						create_info_copy.attachmentCount,
+						create_info_copy.pAttachments,
+						pAllocator);
+					if (cloned_render_pass != VK_NULL_HANDLE)
+					{
 #if RESHADE_VERBOSE_LOG
-					// reshade::log::message(reshade::log::level::info, "vkCreateFramebuffer switched VkRenderPass %p -> %p.", pCreateInfo->renderPass, cloned_render_pass);
+						// reshade::log::message(reshade::log::level::info, "vkCreateFramebuffer switched VkRenderPass %p -> %p.", pCreateInfo->renderPass, cloned_render_pass);
 #endif
-					create_info_copy.renderPass = cloned_render_pass;
+						create_info_copy.renderPass = cloned_render_pass;
+					}
 				}
 			}
-		}
 
-		create_info = &create_info_copy;
+			create_info = &create_info_copy;
+		}
+	#endif
 	}
 
 	const VkResult result = trampoline(device, create_info, pAllocator, pFramebuffer);

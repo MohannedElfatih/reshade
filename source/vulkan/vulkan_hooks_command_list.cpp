@@ -692,6 +692,9 @@ void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindP
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 
 	auto new_pipeline = pipeline;
+#if RESHADE_ADDON
+	if (reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
+	{
 	// Only graphics pipelines are affected
 	if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
 	{
@@ -777,60 +780,11 @@ void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindP
 			}
 		}
 	}
+	}
+#endif
 
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(CmdBindPipeline, device_impl);
 	trampoline(commandBuffer, pipelineBindPoint, new_pipeline);
-
-	// if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
-	// {
-	// 	const auto cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-	// 	auto *pipe_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_PIPELINE, true>(new_pipeline);
-	// 	if (pipe_data != nullptr)
-	// 	{
-	// 		cmd_impl->bound_graphics_pipeline = new_pipeline;
-	// 		cmd_impl->bound_dynamic_states = pipe_data->dynamic_states;
-	// 		cmd_impl->bound_dynamic_states_known = true;
-	// 	}
-	// 	else
-	// 	{
-	// 		cmd_impl->bound_graphics_pipeline = new_pipeline;
-	// 		cmd_impl->bound_dynamic_states.clear();
-	// 		cmd_impl->bound_dynamic_states_known = false;
-	// 	}
-	//
-	// 	if (pipe_data != nullptr && !pipe_data->dynamic_states.empty())
-	// 	{
-	// 		bool needs_alpha_to_coverage = false;
-	// 		bool needs_alpha_to_one = false;
-	// 		for (const VkDynamicState state : pipe_data->dynamic_states)
-	// 		{
-	// 			if (state == VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT)
-	// 				needs_alpha_to_coverage = true;
-	// 			else if (state == VK_DYNAMIC_STATE_ALPHA_TO_ONE_ENABLE_EXT)
-	// 				needs_alpha_to_one = true;
-	// 		}
-	//
-	// 		if (needs_alpha_to_coverage && !cmd_impl->alpha_to_coverage_set && device_impl->_dispatch_table.CmdSetAlphaToCoverageEnableEXT != nullptr)
-	// 		{
-	// 			device_impl->_dispatch_table.CmdSetAlphaToCoverageEnableEXT(commandBuffer, VK_FALSE);
-	// 			cmd_impl->alpha_to_coverage_set = true;
-	// 		}
-	// 		if (needs_alpha_to_one && !cmd_impl->alpha_to_one_set && device_impl->_dispatch_table.CmdSetAlphaToOneEnableEXT != nullptr)
-	// 		{
-	// 			device_impl->_dispatch_table.CmdSetAlphaToOneEnableEXT(commandBuffer, VK_FALSE);
-	// 			cmd_impl->alpha_to_one_set = true;
-	// 		}
-	//
-	// 		// Skip defaulting rasterizer discard here; let callers explicitly set it when supported.
-	// 	}
-	// }
-	// else
-	// {
-	// 	const auto cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-	// 	cmd_impl->bound_graphics_pipeline = VK_NULL_HANDLE;
-	// 	cmd_impl->bound_dynamic_states.clear();
-	// 	cmd_impl->bound_dynamic_states_known = false;
-	// }
 
 #if RESHADE_ADDON >= 2
 	if (!reshade::has_addon_event<reshade::addon_event::bind_pipeline>())
@@ -1965,35 +1919,37 @@ void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRend
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	VkRenderPassBeginInfo begin_info_copy = {};
 
-	if (pRenderPassBegin != nullptr && pRenderPassBegin->framebuffer != VK_NULL_HANDLE)
+#if RESHADE_ADDON
+	if (reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
 	{
-		if (const auto framebuffer_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_FRAMEBUFFER, true>(pRenderPassBegin->framebuffer);
-			framebuffer_data != nullptr &&
-			framebuffer_data->render_pass != VK_NULL_HANDLE &&
-			framebuffer_data->render_pass != pRenderPassBegin->renderPass)
+		if (pRenderPassBegin != nullptr && pRenderPassBegin->framebuffer != VK_NULL_HANDLE)
 		{
-			if (const VkImageView *const attachments = resolve_render_pass_attachments(device_impl, pRenderPassBegin);
-				attachments != nullptr && !framebuffer_data->attachments.empty())
+			if (const auto framebuffer_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_FRAMEBUFFER, true>(pRenderPassBegin->framebuffer);
+				framebuffer_data != nullptr &&
+				framebuffer_data->render_pass != VK_NULL_HANDLE &&
+				framebuffer_data->render_pass != pRenderPassBegin->renderPass)
 			{
-				// Clone the begin render pass for the framebuffer attachments and use that clone.
-				const VkRenderPass cloned_begin_render_pass = create_cloned_render_pass_for_framebuffer(
-					device_impl,
-					pRenderPassBegin->renderPass,
-					static_cast<uint32_t>(framebuffer_data->attachments.size()),
-					attachments,
-					nullptr);
-				if (cloned_begin_render_pass != VK_NULL_HANDLE)
+				if (const VkImageView *const attachments = resolve_render_pass_attachments(device_impl, pRenderPassBegin);
+					attachments != nullptr && !framebuffer_data->attachments.empty())
 				{
-					begin_info_copy = *pRenderPassBegin;
-					begin_info_copy.renderPass = cloned_begin_render_pass;
-					pRenderPassBegin = &begin_info_copy;
+					// Clone the begin render pass for the framebuffer attachments and use that clone.
+					const VkRenderPass cloned_begin_render_pass = create_cloned_render_pass_for_framebuffer(
+						device_impl,
+						pRenderPassBegin->renderPass,
+						static_cast<uint32_t>(framebuffer_data->attachments.size()),
+						attachments,
+						nullptr);
+					if (cloned_begin_render_pass != VK_NULL_HANDLE)
+					{
+						begin_info_copy = *pRenderPassBegin;
+						begin_info_copy.renderPass = cloned_begin_render_pass;
+						pRenderPassBegin = &begin_info_copy;
+					}
 				}
 			}
 		}
 	}
 
-
-#if RESHADE_ADDON
 	const auto cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
 	assert(!cmd_impl->_is_in_render_pass);
@@ -2308,35 +2264,37 @@ void VKAPI_CALL vkCmdBeginRenderPass2(VkCommandBuffer commandBuffer, const VkRen
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	VkRenderPassBeginInfo begin_info_copy = {};
 
-	if (pRenderPassBegin != nullptr && pRenderPassBegin->framebuffer != VK_NULL_HANDLE)
+#if RESHADE_ADDON
+	if (reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
 	{
-		if (const auto framebuffer_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_FRAMEBUFFER, true>(pRenderPassBegin->framebuffer);
-			framebuffer_data != nullptr &&
-			framebuffer_data->render_pass != VK_NULL_HANDLE &&
-			framebuffer_data->render_pass != pRenderPassBegin->renderPass)
+		if (pRenderPassBegin != nullptr && pRenderPassBegin->framebuffer != VK_NULL_HANDLE)
 		{
-			if (const VkImageView *const attachments = resolve_render_pass_attachments(device_impl, pRenderPassBegin);
-				attachments != nullptr && !framebuffer_data->attachments.empty())
+			if (const auto framebuffer_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_FRAMEBUFFER, true>(pRenderPassBegin->framebuffer);
+				framebuffer_data != nullptr &&
+				framebuffer_data->render_pass != VK_NULL_HANDLE &&
+				framebuffer_data->render_pass != pRenderPassBegin->renderPass)
 			{
-				// Clone the begin render pass for the framebuffer attachments and use that clone.
-				const VkRenderPass cloned_begin_render_pass = create_cloned_render_pass_for_framebuffer(
-					device_impl,
-					pRenderPassBegin->renderPass,
-					static_cast<uint32_t>(framebuffer_data->attachments.size()),
-					attachments,
-					nullptr);
-				if (cloned_begin_render_pass != VK_NULL_HANDLE)
+				if (const VkImageView *const attachments = resolve_render_pass_attachments(device_impl, pRenderPassBegin);
+					attachments != nullptr && !framebuffer_data->attachments.empty())
 				{
-					begin_info_copy = *pRenderPassBegin;
-					begin_info_copy.renderPass = cloned_begin_render_pass;
-					pRenderPassBegin = &begin_info_copy;
+					// Clone the begin render pass for the framebuffer attachments and use that clone.
+					const VkRenderPass cloned_begin_render_pass = create_cloned_render_pass_for_framebuffer(
+						device_impl,
+						pRenderPassBegin->renderPass,
+						static_cast<uint32_t>(framebuffer_data->attachments.size()),
+						attachments,
+						nullptr);
+					if (cloned_begin_render_pass != VK_NULL_HANDLE)
+					{
+						begin_info_copy = *pRenderPassBegin;
+						begin_info_copy.renderPass = cloned_begin_render_pass;
+						pRenderPassBegin = &begin_info_copy;
+					}
 				}
 			}
 		}
 	}
 
-
-#if RESHADE_ADDON
 	const auto cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
 	assert(!cmd_impl->_is_in_render_pass);
