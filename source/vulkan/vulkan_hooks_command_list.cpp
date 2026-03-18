@@ -456,12 +456,34 @@ static VkPipeline create_dynamic_rendering_clone(
 	rendering_ci.pNext = ci.pNext;
 	ci.pNext = &rendering_ci;
 
+	// TODO(Ritsu): Handle stale VkShaderModule handles in captured pipeline stages.
+	for (uint32_t i = 0; i < ci.stageCount; ++i)
+	{
+		const VkShaderModule module = ci.pStages[i].module;
+		if (module != VK_NULL_HANDLE && !reshade::vulkan::is_tracked_shader_module_alive(device_impl->_orig, module))
+		{
+			assert(false && "stale shader module handle in dynamic rendering clone");
+			reshade::log::message(
+				reshade::log::level::warning,
+				"create_dynamic_rendering_clone: stale VkShaderModule handle in stage %u, keeping original pipeline.",
+				i);
+			return VK_NULL_HANDLE;
+		}
+	}
+
 	VkPipeline clone = VK_NULL_HANDLE;
 	const VkResult res =
 		device_impl->_dispatch_table.CreateGraphicsPipelines(device_impl->_orig, VK_NULL_HANDLE, 1, &ci, nullptr, &clone);
 
 	if (res != VK_SUCCESS)
+	{
+		assert(clone == VK_NULL_HANDLE);
+		reshade::log::message(
+			reshade::log::level::warning,
+			"create_dynamic_rendering_clone: vkCreateGraphicsPipelines failed with error code %d, keeping original pipeline.",
+			static_cast<int>(res));
 		return VK_NULL_HANDLE;
+	}
 
 	{
 		const std::lock_guard<std::mutex> lock(*pd->dynamic_rendering_mutex);
@@ -484,6 +506,11 @@ static VkPipeline create_render_pass_clone(
 	VkPipeline pipeline,
 	VkRenderPass target_render_pass)
 {
+#if RESHADE_ADDON
+	if (!reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
+		return VK_NULL_HANDLE;
+#endif
+
 	if (!pd->is_graphics || target_render_pass == VK_NULL_HANDLE)
 		return VK_NULL_HANDLE;
 
@@ -508,12 +535,33 @@ static VkPipeline create_render_pass_clone(
 	VkGraphicsPipelineCreateInfo ci = pd->captured_ci;
 	ci.renderPass = target_render_pass;
 
+	for (uint32_t i = 0; i < ci.stageCount; ++i)
+	{
+		const VkShaderModule module = ci.pStages[i].module;
+		if (module != VK_NULL_HANDLE && !reshade::vulkan::is_tracked_shader_module_alive(device_impl->_orig, module))
+		{
+			assert(false && "stale shader module handle in render pass clone");
+			reshade::log::message(
+				reshade::log::level::warning,
+				"create_render_pass_clone: stale VkShaderModule handle in stage %u, keeping original pipeline.",
+				i);
+			return VK_NULL_HANDLE;
+		}
+	}
+
 	VkPipeline clone = VK_NULL_HANDLE;
 	const VkResult res =
 		device_impl->_dispatch_table.CreateGraphicsPipelines(device_impl->_orig, VK_NULL_HANDLE, 1, &ci, nullptr, &clone);
 
 	if (res != VK_SUCCESS)
+	{
+		assert(clone == VK_NULL_HANDLE);
+		reshade::log::message(
+			reshade::log::level::warning,
+			"create_render_pass_clone: vkCreateGraphicsPipelines failed with error code %d, keeping original pipeline.",
+			static_cast<int>(res));
 		return VK_NULL_HANDLE;
+	}
 
 	{
 		const std::lock_guard<std::mutex> lock(*pd->render_pass_clone_mutex);
@@ -747,35 +795,17 @@ void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindP
 				pipe_data->captured_ci.renderPass != VK_NULL_HANDLE &&
 				pipe_data->captured_ci.renderPass != cmd_impl->current_render_pass)
 			{
-				const auto original_render_pass_data =
-					device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(pipe_data->captured_ci.renderPass);
+				// Always try to clone to the currently active render pass.
+				// If clone creation fails (e.g. incompatible), keep original pipeline bound.
+				const VkPipeline clone = create_render_pass_clone(
+					device_impl,
+					pipe_data,
+					new_pipeline,
+					cmd_impl->current_render_pass);
 
-				// Only clone when this command buffer is using a known cloned render pass for the pipeline's original render pass.
-				bool is_cached_clone = false;
-				if (original_render_pass_data != nullptr)
+				if (clone != VK_NULL_HANDLE)
 				{
-					const std::lock_guard<std::mutex> lock(*original_render_pass_data->cloned_render_pass_mutex);
-					for (VkRenderPass cached_clone : original_render_pass_data->cloned_render_passes)
-					{
-						if (cached_clone == cmd_impl->current_render_pass)
-						{
-							is_cached_clone = true;
-							break;
-						}
-					}
-				}
-				if (is_cached_clone)
-				{
-					const VkPipeline clone = create_render_pass_clone(
-						device_impl,
-						pipe_data,
-						new_pipeline,
-						cmd_impl->current_render_pass);
-
-					if (clone != VK_NULL_HANDLE)
-					{
-						new_pipeline = clone;
-					}
+					new_pipeline = clone;
 				}
 			}
 		}
@@ -1187,8 +1217,6 @@ void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage, 
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(CmdBlitImage, device_impl);
-	srcImage = srcImage;
-	dstImage = dstImage;
 
 #if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::copy_texture_region>())

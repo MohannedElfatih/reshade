@@ -53,6 +53,11 @@ struct vulkan_instance
 	GladVulkanContext dispatch_table;
 };
 
+namespace reshade::vulkan
+{
+	bool is_tracked_shader_module_alive(VkDevice device, VkShaderModule shader_module);
+}
+
 #define RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(name, device) \
 	assert((device) != nullptr); \
 	PFN_vk##name trampoline = (device)->_dispatch_table.name; \

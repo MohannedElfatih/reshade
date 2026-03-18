@@ -16,6 +16,7 @@
 #include "lockfree_linear_map.hpp"
 #include <cstring> // std::strcmp, std::strncmp
 #include <algorithm> // std::find_if, std::min
+#include <unordered_set>
 #include <mutex>
 
 // Set during Vulkan device creation and presentation, to avoid hooking internal D3D devices created e.g. by NVIDIA Ansel, Optimus or layered DXGI swapchain
@@ -23,6 +24,42 @@ extern thread_local bool g_in_dxgi_runtime;
 
 extern lockfree_linear_map<void *, vulkan_instance, 16> g_vulkan_instances;
 lockfree_linear_map<void *, reshade::vulkan::device_impl *, 8> g_vulkan_devices;
+
+namespace
+{
+	struct shader_module_key
+	{
+		VkDevice device;
+		VkShaderModule module;
+
+		bool operator==(const shader_module_key &other) const
+		{
+			return device == other.device && module == other.module;
+		}
+	};
+
+	struct shader_module_key_hash
+	{
+		size_t operator()(const shader_module_key &key) const
+		{
+			const size_t h1 = std::hash<uint64_t>()(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(key.device)));
+			const size_t h2 = std::hash<uint64_t>()(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(key.module)));
+			return h1 ^ (h2 + 0x9e3779b97f4a7c15ull + (h1 << 6) + (h1 >> 2));
+		}
+	};
+
+	std::mutex g_live_shader_modules_mutex;
+	std::unordered_set<shader_module_key, shader_module_key_hash> g_live_shader_modules;
+}
+
+bool reshade::vulkan::is_tracked_shader_module_alive(VkDevice device, VkShaderModule shader_module)
+{
+	if (device == VK_NULL_HANDLE || shader_module == VK_NULL_HANDLE)
+		return false;
+
+	const std::lock_guard<std::mutex> lock(g_live_shader_modules_mutex);
+	return g_live_shader_modules.find({ device, shader_module }) != g_live_shader_modules.end();
+}
 
 #if RESHADE_ADDON
 void create_default_view(reshade::vulkan::device_impl *device_impl, VkImage image)
@@ -1382,6 +1419,11 @@ VkResult VKAPI_CALL vkCreateShaderModule(VkDevice device, const VkShaderModuleCr
 		return result;
 	}
 
+	{
+		const std::lock_guard<std::mutex> lock(g_live_shader_modules_mutex);
+		g_live_shader_modules.insert({ device, *pShaderModule });
+	}
+
 #if RESHADE_ADDON >= 2
 	reshade::vulkan::object_data<VK_OBJECT_TYPE_SHADER_MODULE> &data = *device_impl->register_object<VK_OBJECT_TYPE_SHADER_MODULE>(*pShaderModule);
 	data.spirv.assign(reinterpret_cast<const uint8_t *>(pCreateInfo->pCode), reinterpret_cast<const uint8_t *>(pCreateInfo->pCode) + pCreateInfo->codeSize);
@@ -1400,6 +1442,11 @@ void     VKAPI_CALL vkDestroyShaderModule(VkDevice device, VkShaderModule shader
 #if RESHADE_ADDON >= 2
 	device_impl->unregister_object<VK_OBJECT_TYPE_SHADER_MODULE>(shaderModule);
 #endif
+
+	{
+		const std::lock_guard<std::mutex> lock(g_live_shader_modules_mutex);
+		g_live_shader_modules.erase({ device, shaderModule });
+	}
 
 	trampoline(device, shaderModule, pAllocator);
 }
