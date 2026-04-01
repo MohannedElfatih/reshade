@@ -467,7 +467,7 @@ static VkPipeline create_dynamic_rendering_clone(
 				reshade::log::level::warning,
 				"create_dynamic_rendering_clone: stale VkShaderModule handle in stage %u, keeping original pipeline.",
 				i);
-			return VK_NULL_HANDLE;
+		return VK_NULL_HANDLE;
 		}
 	}
 
@@ -475,14 +475,21 @@ static VkPipeline create_dynamic_rendering_clone(
 	const VkResult res =
 		device_impl->_dispatch_table.CreateGraphicsPipelines(device_impl->_orig, VK_NULL_HANDLE, 1, &ci, nullptr, &clone);
 
-	if (res != VK_SUCCESS)
+	if (res < VK_SUCCESS)
 	{
 		assert(clone == VK_NULL_HANDLE);
 		reshade::log::message(
-			reshade::log::level::warning,
+			reshade::log::level::error,
 			"create_dynamic_rendering_clone: vkCreateGraphicsPipelines failed with error code %d, keeping original pipeline.",
 			static_cast<int>(res));
 		return VK_NULL_HANDLE;
+	}
+	if (res > VK_SUCCESS)
+	{
+		reshade::log::message(
+			reshade::log::level::info,
+			"create_dynamic_rendering_clone: vkCreateGraphicsPipelines returned status code %d.",
+			static_cast<int>(res));
 	}
 
 	{
@@ -545,7 +552,7 @@ static VkPipeline create_render_pass_clone(
 				reshade::log::level::warning,
 				"create_render_pass_clone: stale VkShaderModule handle in stage %u, keeping original pipeline.",
 				i);
-			return VK_NULL_HANDLE;
+		return VK_NULL_HANDLE;
 		}
 	}
 
@@ -553,7 +560,7 @@ static VkPipeline create_render_pass_clone(
 	const VkResult res =
 		device_impl->_dispatch_table.CreateGraphicsPipelines(device_impl->_orig, VK_NULL_HANDLE, 1, &ci, nullptr, &clone);
 
-	if (res != VK_SUCCESS)
+	if (res < VK_SUCCESS)
 	{
 		assert(clone == VK_NULL_HANDLE);
 		reshade::log::message(
@@ -561,6 +568,13 @@ static VkPipeline create_render_pass_clone(
 			"create_render_pass_clone: vkCreateGraphicsPipelines failed with error code %d, keeping original pipeline.",
 			static_cast<int>(res));
 		return VK_NULL_HANDLE;
+	}
+	if (res > VK_SUCCESS)
+	{
+		reshade::log::message(
+			reshade::log::level::info,
+			"create_render_pass_clone: vkCreateGraphicsPipelines returned status code %d.",
+			static_cast<int>(res));
 	}
 
 	{
@@ -613,7 +627,10 @@ static VkPipeline create_render_pass_clone(
 		for (uint32_t i = 0; i < ci.stageCount; ++i)
 		{
 			const VkPipelineShaderStageCreateInfo &stage = ci.pStages[i];
-			const auto module_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_SHADER_MODULE, true>(stage.module);
+			const auto module_data =
+				stage.module != VK_NULL_HANDLE && reshade::vulkan::is_tracked_shader_module_alive(device_impl->_orig, stage.module) ?
+					device_impl->get_private_data_for_object<VK_OBJECT_TYPE_SHADER_MODULE, true>(stage.module) :
+					nullptr;
 
 			reshade::api::shader_desc *desc = nullptr;
 			switch (stage.stage)

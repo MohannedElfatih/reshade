@@ -1809,8 +1809,9 @@ bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, 
 		color_blend_state_info.attachmentCount = 0;
 		for (uint32_t i = 0; i < render_target_formats.count; ++i, ++color_blend_state_info.attachmentCount)
 		{
-			attachment_formats[i] = convert_format(static_cast<const api::format *>(render_target_formats.data)[i]);
-			assert(attachment_formats[i] != VK_FORMAT_UNDEFINED);
+			const api::format attachment_format = static_cast<const api::format *>(render_target_formats.data)[i];
+			attachment_formats[i] = convert_format(attachment_format);
+			assert((attachment_format == api::format::unknown) == (attachment_formats[i] == VK_FORMAT_UNDEFINED));
 		}
 
 #if VK_KHR_dynamic_rendering

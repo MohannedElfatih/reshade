@@ -474,16 +474,27 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 
 	VkPhysicalDeviceHostImageCopyFeatures host_image_copy_features;
 	VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified_image_layouts_features;
+	VkPhysicalDeviceVulkan14Features vulkan_14_features;
 	if (const auto existing_vulkan_14_features = find_in_structure_chain<VkPhysicalDeviceVulkan14Features>(
 			pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES))
 	{
 		assert(instance.api_version >= VK_API_VERSION_1_4);
 
+		const_cast<VkPhysicalDeviceVulkan14Features *>(existing_vulkan_14_features)->pushDescriptor = VK_TRUE;
 		push_descriptor_ext = existing_vulkan_14_features->pushDescriptor;
 		host_image_copy_ext = existing_vulkan_14_features->hostImageCopy;
 	}
 	else
 	{
+		if (instance.api_version >= VK_API_VERSION_1_4)
+		{
+			vulkan_14_features = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES, const_cast<void *>(create_info.pNext) };
+			vulkan_14_features.pushDescriptor = VK_TRUE;
+
+			create_info.pNext = &vulkan_14_features;
+			push_descriptor_ext = true;
+		}
+
 		if (const auto existing_host_image_copy_features = find_in_structure_chain<VkPhysicalDeviceHostImageCopyFeatures>(
 				pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES))
 		{
