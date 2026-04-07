@@ -9,6 +9,7 @@
 #include "vulkan_impl_type_convert.hpp"
 #include "dll_log.hpp"
 #include "addon_manager.hpp"
+#include "ini_file.hpp"
 #include "lockfree_linear_map.hpp"
 #include <cstring> // std::memcpy, std::memset
 #include <algorithm> // std::copy_n, std::max, std::min, std::swap
@@ -23,6 +24,43 @@ VkRenderPass create_cloned_render_pass_for_framebuffer(
 	const VkAllocationCallbacks *allocator);
 
 #if RESHADE_ADDON
+bool reshade::vulkan::allow_render_pass_to_dynamic_rendering(const GladVulkanContext &dispatch_table)
+{
+#if !VK_KHR_dynamic_rendering
+	(void)dispatch_table;
+	return false;
+#else
+	if (!dispatch_table.KHR_dynamic_rendering)
+		return false;
+
+	bool enabled = false;
+	reshade::global_config().get("VULKAN", "AllowRenderPassToDynamicRendering", enabled);
+	return enabled;
+#endif
+}
+
+static void reset_render_pass_state(reshade::vulkan::object_data<VK_OBJECT_TYPE_COMMAND_BUFFER> *cmd_impl)
+{
+	cmd_impl->current_subpass = std::numeric_limits<uint32_t>::max();
+	cmd_impl->current_render_pass = VK_NULL_HANDLE;
+	cmd_impl->current_framebuffer = VK_NULL_HANDLE;
+	cmd_impl->current_color_attachment_count = 0;
+	cmd_impl->current_rendering_samples = VK_SAMPLE_COUNT_1_BIT;
+
+	std::memset(cmd_impl->current_color_attachments, 0, sizeof(cmd_impl->current_color_attachments));
+	std::memset(cmd_impl->current_resolve_attachments, 0, sizeof(cmd_impl->current_resolve_attachments));
+	std::memset(cmd_impl->current_color_attachment_replaced, 0, sizeof(cmd_impl->current_color_attachment_replaced));
+	std::memset(cmd_impl->current_resolve_attachment_replaced, 0, sizeof(cmd_impl->current_resolve_attachment_replaced));
+	std::memset(cmd_impl->current_color_attachment_formats, 0, sizeof(cmd_impl->current_color_attachment_formats));
+
+	cmd_impl->current_depth_stencil_attachment = VK_NULL_HANDLE;
+	cmd_impl->current_depth_attachment_format = VK_FORMAT_UNDEFINED;
+	cmd_impl->current_stencil_attachment_format = VK_FORMAT_UNDEFINED;
+
+	cmd_impl->using_dynamic_rendering = false;
+	cmd_impl->_is_in_render_pass = false;
+}
+
 static void invoke_begin_render_pass_event(const reshade::vulkan::device_impl *device_impl, reshade::vulkan::object_data<VK_OBJECT_TYPE_COMMAND_BUFFER> *cmd_impl, const VkRenderPassBeginInfo *begin_info)
 {
 	const auto render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS>(cmd_impl->current_render_pass);
@@ -410,6 +448,181 @@ static bool signatures_match(
 	return true;
 }
 
+#if RESHADE_ADDON >= 2
+static void invoke_init_pipeline_for_graphics_clone(
+	reshade::vulkan::device_impl *device_impl,
+	const VkGraphicsPipelineCreateInfo &ci,
+	VkRenderPass target_render_pass,
+	VkPipeline clone)
+{
+	if (!reshade::has_addon_event<reshade::addon_event::init_pipeline>())
+		return;
+
+	reshade::api::pipeline_flags flags = reshade::vulkan::convert_pipeline_flags(ci.flags);
+
+	reshade::api::shader_desc vertex_desc = {};
+	reshade::api::shader_desc hull_desc = {};
+	reshade::api::shader_desc domain_desc = {};
+	reshade::api::shader_desc geometry_desc = {};
+	reshade::api::shader_desc pixel_desc = {};
+	reshade::api::shader_desc amplification_desc = {};
+	reshade::api::shader_desc mesh_desc = {};
+
+	reshade::api::stream_output_desc stream_output_desc = {};
+	reshade::api::blend_desc blend_desc = {};
+	reshade::api::rasterizer_desc rasterizer_desc = {};
+	reshade::api::depth_stencil_desc depth_stencil_desc = {};
+	std::vector<reshade::api::input_element> input_layout;
+	reshade::api::primitive_topology topology = reshade::api::primitive_topology::triangle_list;
+
+	reshade::api::format depth_stencil_format = reshade::api::format::unknown;
+	reshade::api::format render_target_formats[8] = {};
+
+	uint32_t sample_mask = (ci.pMultisampleState != nullptr && ci.pMultisampleState->pSampleMask != nullptr) ? *ci.pMultisampleState->pSampleMask : UINT32_MAX;
+	uint32_t sample_count = (ci.pMultisampleState != nullptr) ? static_cast<uint32_t>(ci.pMultisampleState->rasterizationSamples) : 1;
+	uint32_t viewport_count = (ci.pViewportState != nullptr) ? ci.pViewportState->viewportCount : 1;
+	uint32_t render_target_count = 0;
+
+	std::vector<reshade::api::pipeline_subobject> subobjects;
+
+	for (uint32_t i = 0; i < ci.stageCount; ++i)
+	{
+		const VkPipelineShaderStageCreateInfo &stage = ci.pStages[i];
+		const auto module_data =
+			stage.module != VK_NULL_HANDLE && reshade::vulkan::is_tracked_shader_module_alive(device_impl->_orig, stage.module) ?
+				device_impl->get_private_data_for_object<VK_OBJECT_TYPE_SHADER_MODULE, true>(stage.module) :
+				nullptr;
+
+		reshade::api::shader_desc *desc = nullptr;
+		switch (stage.stage)
+		{
+		case VK_SHADER_STAGE_VERTEX_BIT:
+			desc = &vertex_desc;
+			subobjects.push_back({ reshade::api::pipeline_subobject_type::vertex_shader, 1, &vertex_desc });
+			break;
+		case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
+			desc = &hull_desc;
+			subobjects.push_back({ reshade::api::pipeline_subobject_type::hull_shader, 1, &hull_desc });
+			break;
+		case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:
+			desc = &domain_desc;
+			subobjects.push_back({ reshade::api::pipeline_subobject_type::domain_shader, 1, &domain_desc });
+			break;
+		case VK_SHADER_STAGE_GEOMETRY_BIT:
+			desc = &geometry_desc;
+			subobjects.push_back({ reshade::api::pipeline_subobject_type::geometry_shader, 1, &geometry_desc });
+			break;
+		case VK_SHADER_STAGE_FRAGMENT_BIT:
+			desc = &pixel_desc;
+			subobjects.push_back({ reshade::api::pipeline_subobject_type::pixel_shader, 1, &pixel_desc });
+			break;
+#if VK_EXT_mesh_shader
+		case VK_SHADER_STAGE_TASK_BIT_EXT:
+			desc = &amplification_desc;
+			subobjects.push_back({ reshade::api::pipeline_subobject_type::amplification_shader, 1, &amplification_desc });
+			break;
+		case VK_SHADER_STAGE_MESH_BIT_EXT:
+			desc = &mesh_desc;
+			subobjects.push_back({ reshade::api::pipeline_subobject_type::mesh_shader, 1, &mesh_desc });
+			break;
+#endif
+		default:
+			break;
+		}
+
+		if (desc != nullptr)
+		{
+			desc->entry_point = stage.pName;
+			if (module_data != nullptr)
+			{
+				desc->code = module_data->spirv.data();
+				desc->code_size = module_data->spirv.size();
+			}
+		}
+	}
+
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::flags, 1, &flags });
+
+	auto dynamic_states = reshade::vulkan::convert_dynamic_states(ci.pDynamicState);
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::dynamic_pipeline_states, static_cast<uint32_t>(dynamic_states.size()), dynamic_states.data() });
+
+	input_layout = reshade::vulkan::convert_input_layout_desc(ci.pVertexInputState);
+	if ((hull_desc.code_size != 0 || domain_desc.code_size != 0) && ci.pTessellationState != nullptr)
+	{
+		topology = static_cast<reshade::api::primitive_topology>(
+			static_cast<uint32_t>(reshade::api::primitive_topology::patch_list_01_cp) +
+			ci.pTessellationState->patchControlPoints - 1);
+	}
+	else if (ci.pInputAssemblyState != nullptr)
+	{
+		topology = reshade::vulkan::convert_primitive_topology(ci.pInputAssemblyState->topology);
+	}
+
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::input_layout, static_cast<uint32_t>(input_layout.size()), input_layout.data() });
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::primitive_topology, 1, &topology });
+
+#if VK_EXT_transform_feedback
+	stream_output_desc = reshade::vulkan::convert_stream_output_desc(ci.pRasterizationState);
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::stream_output_state, 1, &stream_output_desc });
+#endif
+
+	rasterizer_desc = reshade::vulkan::convert_rasterizer_desc(ci.pRasterizationState, ci.pMultisampleState);
+	depth_stencil_desc = reshade::vulkan::convert_depth_stencil_desc(ci.pDepthStencilState);
+	blend_desc = reshade::vulkan::convert_blend_desc(ci.pColorBlendState, ci.pMultisampleState);
+
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::rasterizer_state, 1, &rasterizer_desc });
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::viewport_count, 1, &viewport_count });
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::depth_stencil_state, 1, &depth_stencil_desc });
+
+	if (target_render_pass != VK_NULL_HANDLE)
+	{
+		if (const auto render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(target_render_pass);
+			render_pass_data != nullptr && ci.subpass < render_pass_data->subpasses.size())
+		{
+			const auto &subpass = render_pass_data->subpasses[ci.subpass];
+			render_target_count = subpass.num_color_attachments;
+			for (uint32_t k = 0; k < render_target_count && k < 8; ++k)
+			{
+				const uint32_t a = subpass.color_attachments[k];
+				if (a != VK_ATTACHMENT_UNUSED && a < render_pass_data->attachments.size())
+					render_target_formats[k] = reshade::vulkan::convert_format(render_pass_data->attachments[a].format);
+			}
+
+			const uint32_t dsa = subpass.depth_stencil_attachment;
+			if (dsa != VK_ATTACHMENT_UNUSED && dsa < render_pass_data->attachments.size())
+				depth_stencil_format = reshade::vulkan::convert_format(render_pass_data->attachments[dsa].format);
+		}
+	}
+	else if (const auto dynamic_rendering_info = find_in_structure_chain<VkPipelineRenderingCreateInfo>(
+		ci.pNext, VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO))
+	{
+		assert(dynamic_rendering_info->colorAttachmentCount <= 8);
+		render_target_count = std::min(dynamic_rendering_info->colorAttachmentCount, 8u);
+
+		for (uint32_t k = 0; k < render_target_count; ++k)
+			render_target_formats[k] = reshade::vulkan::convert_format(dynamic_rendering_info->pColorAttachmentFormats[k]);
+
+		if (dynamic_rendering_info->depthAttachmentFormat != VK_FORMAT_UNDEFINED)
+			depth_stencil_format = reshade::vulkan::convert_format(dynamic_rendering_info->depthAttachmentFormat);
+		else
+			depth_stencil_format = reshade::vulkan::convert_format(dynamic_rendering_info->stencilAttachmentFormat);
+	}
+
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::blend_state, 1, &blend_desc });
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::render_target_formats, render_target_count, render_target_formats });
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::depth_stencil_format, 1, &depth_stencil_format });
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::sample_mask, 1, &sample_mask });
+	subobjects.push_back({ reshade::api::pipeline_subobject_type::sample_count, 1, &sample_count });
+
+	reshade::invoke_addon_event<reshade::addon_event::init_pipeline>(
+		device_impl,
+		reshade::api::pipeline_layout { (uint64_t)ci.layout },
+		static_cast<uint32_t>(subobjects.size()),
+		subobjects.data(),
+		reshade::api::pipeline { (uint64_t)clone });
+}
+#endif
+
 static VkPipeline create_dynamic_rendering_clone(
 	reshade::vulkan::device_impl *device_impl,
 	reshade::vulkan::object_data<VK_OBJECT_TYPE_PIPELINE> *pd,
@@ -505,6 +718,13 @@ static VkPipeline create_dynamic_rendering_clone(
 		pd->dynamic_rendering_signatures.push_back(signature);
 		pd->dynamic_rendering_pipelines.push_back(clone);
 	}
+
+#if RESHADE_ADDON >= 2
+	// Internal dynamic rendering clones bypass vkCreateGraphicsPipelines hooks,
+	// so emit init_pipeline explicitly for addons with reconstructed subobjects.
+	invoke_init_pipeline_for_graphics_clone(device_impl, ci, VK_NULL_HANDLE, clone);
+#endif
+
 	return clone;
 }
 static VkPipeline create_render_pass_clone(
@@ -595,154 +815,7 @@ static VkPipeline create_render_pass_clone(
 #if RESHADE_ADDON >= 2
 	// Internal render pass clones bypass vkCreateGraphicsPipelines hooks,
 	// so emit init_pipeline explicitly for addons with reconstructed subobjects.
-	if (reshade::has_addon_event<reshade::addon_event::init_pipeline>())
-	{
-		reshade::api::pipeline_flags flags = reshade::vulkan::convert_pipeline_flags(ci.flags);
-
-		reshade::api::shader_desc vertex_desc = {};
-		reshade::api::shader_desc hull_desc = {};
-		reshade::api::shader_desc domain_desc = {};
-		reshade::api::shader_desc geometry_desc = {};
-		reshade::api::shader_desc pixel_desc = {};
-		reshade::api::shader_desc amplification_desc = {};
-		reshade::api::shader_desc mesh_desc = {};
-
-		reshade::api::stream_output_desc stream_output_desc = {};
-		reshade::api::blend_desc blend_desc = {};
-		reshade::api::rasterizer_desc rasterizer_desc = {};
-		reshade::api::depth_stencil_desc depth_stencil_desc = {};
-		std::vector<reshade::api::input_element> input_layout;
-		reshade::api::primitive_topology topology = reshade::api::primitive_topology::triangle_list;
-
-		reshade::api::format depth_stencil_format = reshade::api::format::unknown;
-		reshade::api::format render_target_formats[8] = {};
-
-		uint32_t sample_mask = (ci.pMultisampleState != nullptr && ci.pMultisampleState->pSampleMask != nullptr) ? *ci.pMultisampleState->pSampleMask : UINT32_MAX;
-		uint32_t sample_count = (ci.pMultisampleState != nullptr) ? static_cast<uint32_t>(ci.pMultisampleState->rasterizationSamples) : 1;
-		uint32_t viewport_count = (ci.pViewportState != nullptr) ? ci.pViewportState->viewportCount : 1;
-		uint32_t render_target_count = 0;
-
-		std::vector<reshade::api::pipeline_subobject> subobjects;
-
-		for (uint32_t i = 0; i < ci.stageCount; ++i)
-		{
-			const VkPipelineShaderStageCreateInfo &stage = ci.pStages[i];
-			const auto module_data =
-				stage.module != VK_NULL_HANDLE && reshade::vulkan::is_tracked_shader_module_alive(device_impl->_orig, stage.module) ?
-					device_impl->get_private_data_for_object<VK_OBJECT_TYPE_SHADER_MODULE, true>(stage.module) :
-					nullptr;
-
-			reshade::api::shader_desc *desc = nullptr;
-			switch (stage.stage)
-			{
-			case VK_SHADER_STAGE_VERTEX_BIT:
-				desc = &vertex_desc;
-				subobjects.push_back({ reshade::api::pipeline_subobject_type::vertex_shader, 1, &vertex_desc });
-				break;
-			case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
-				desc = &hull_desc;
-				subobjects.push_back({ reshade::api::pipeline_subobject_type::hull_shader, 1, &hull_desc });
-				break;
-			case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:
-				desc = &domain_desc;
-				subobjects.push_back({ reshade::api::pipeline_subobject_type::domain_shader, 1, &domain_desc });
-				break;
-			case VK_SHADER_STAGE_GEOMETRY_BIT:
-				desc = &geometry_desc;
-				subobjects.push_back({ reshade::api::pipeline_subobject_type::geometry_shader, 1, &geometry_desc });
-				break;
-			case VK_SHADER_STAGE_FRAGMENT_BIT:
-				desc = &pixel_desc;
-				subobjects.push_back({ reshade::api::pipeline_subobject_type::pixel_shader, 1, &pixel_desc });
-				break;
-#if VK_EXT_mesh_shader
-			case VK_SHADER_STAGE_TASK_BIT_EXT:
-				desc = &amplification_desc;
-				subobjects.push_back({ reshade::api::pipeline_subobject_type::amplification_shader, 1, &amplification_desc });
-				break;
-			case VK_SHADER_STAGE_MESH_BIT_EXT:
-				desc = &mesh_desc;
-				subobjects.push_back({ reshade::api::pipeline_subobject_type::mesh_shader, 1, &mesh_desc });
-				break;
-#endif
-			default:
-				break;
-			}
-
-			if (desc != nullptr)
-			{
-				desc->entry_point = stage.pName;
-				if (module_data != nullptr)
-				{
-					desc->code = module_data->spirv.data();
-					desc->code_size = module_data->spirv.size();
-				}
-			}
-		}
-
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::flags, 1, &flags });
-
-		auto dynamic_states = reshade::vulkan::convert_dynamic_states(ci.pDynamicState);
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::dynamic_pipeline_states, static_cast<uint32_t>(dynamic_states.size()), dynamic_states.data() });
-
-		input_layout = reshade::vulkan::convert_input_layout_desc(ci.pVertexInputState);
-		if ((hull_desc.code_size != 0 || domain_desc.code_size != 0) && ci.pTessellationState != nullptr)
-		{
-			topology = static_cast<reshade::api::primitive_topology>(
-				static_cast<uint32_t>(reshade::api::primitive_topology::patch_list_01_cp) +
-				ci.pTessellationState->patchControlPoints - 1);
-		}
-		else if (ci.pInputAssemblyState != nullptr)
-		{
-			topology = reshade::vulkan::convert_primitive_topology(ci.pInputAssemblyState->topology);
-		}
-
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::input_layout, static_cast<uint32_t>(input_layout.size()), input_layout.data() });
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::primitive_topology, 1, &topology });
-
-#if VK_EXT_transform_feedback
-		stream_output_desc = reshade::vulkan::convert_stream_output_desc(ci.pRasterizationState);
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::stream_output_state, 1, &stream_output_desc });
-#endif
-
-		rasterizer_desc = reshade::vulkan::convert_rasterizer_desc(ci.pRasterizationState, ci.pMultisampleState);
-		depth_stencil_desc = reshade::vulkan::convert_depth_stencil_desc(ci.pDepthStencilState);
-		blend_desc = reshade::vulkan::convert_blend_desc(ci.pColorBlendState, ci.pMultisampleState);
-
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::rasterizer_state, 1, &rasterizer_desc });
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::viewport_count, 1, &viewport_count });
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::depth_stencil_state, 1, &depth_stencil_desc });
-
-		if (const auto render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(target_render_pass);
-			render_pass_data != nullptr && ci.subpass < render_pass_data->subpasses.size())
-		{
-			const auto &subpass = render_pass_data->subpasses[ci.subpass];
-			render_target_count = subpass.num_color_attachments;
-			for (uint32_t k = 0; k < render_target_count && k < 8; ++k)
-			{
-				const uint32_t a = subpass.color_attachments[k];
-				if (a != VK_ATTACHMENT_UNUSED && a < render_pass_data->attachments.size())
-					render_target_formats[k] = reshade::vulkan::convert_format(render_pass_data->attachments[a].format);
-			}
-
-			const uint32_t dsa = subpass.depth_stencil_attachment;
-			if (dsa != VK_ATTACHMENT_UNUSED && dsa < render_pass_data->attachments.size())
-				depth_stencil_format = reshade::vulkan::convert_format(render_pass_data->attachments[dsa].format);
-		}
-
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::blend_state, 1, &blend_desc });
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::render_target_formats, render_target_count, render_target_formats });
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::depth_stencil_format, 1, &depth_stencil_format });
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::sample_mask, 1, &sample_mask });
-		subobjects.push_back({ reshade::api::pipeline_subobject_type::sample_count, 1, &sample_count });
-
-		reshade::invoke_addon_event<reshade::addon_event::init_pipeline>(
-			device_impl,
-			reshade::api::pipeline_layout { (uint64_t)ci.layout },
-			static_cast<uint32_t>(subobjects.size()),
-			subobjects.data(),
-			reshade::api::pipeline { (uint64_t)clone });
-	}
+	invoke_init_pipeline_for_graphics_clone(device_impl, ci, target_render_pass, clone);
 #endif
 
 #if RESHADE_VERBOSE_LOG
@@ -2010,9 +2083,7 @@ void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRend
 
 	// Temporary safety valve: keep legacy render pass path to avoid state/layout mismatches
 	// in applications that do not tolerate emulation via dynamic rendering.
-	const bool allow_render_pass_to_dynamic_rendering = false;
-	if (allow_render_pass_to_dynamic_rendering &&
-		device_impl->_dispatch_table.KHR_dynamic_rendering &&
+	if (reshade::vulkan::allow_render_pass_to_dynamic_rendering(device_impl->_dispatch_table) &&
 		should_use_dynamic_rendering(device_impl, pRenderPassBegin))
 	{
 		// Resolve attachments
@@ -2226,7 +2297,8 @@ void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer commandBuffer)
 		device_impl->_dispatch_table.CmdEndRendering(commandBuffer);
 
 		// Clear state
-		cmd_impl->using_dynamic_rendering = false;
+		reshade::invoke_addon_event<reshade::addon_event::end_render_pass>(cmd_impl);
+		reset_render_pass_state(cmd_impl);
 		return; // IMPORTANT: do NOT trampoline
 	}
 #endif
@@ -2238,14 +2310,7 @@ void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer commandBuffer)
 
 	reshade::invoke_addon_event<reshade::addon_event::end_render_pass>(cmd_impl);
 
-	cmd_impl->current_subpass = std::numeric_limits<uint32_t>::max();
-	cmd_impl->current_render_pass = VK_NULL_HANDLE;
-	cmd_impl->current_framebuffer = VK_NULL_HANDLE;
-
-	std::memset(cmd_impl->current_color_attachments, 0, sizeof(cmd_impl->current_color_attachments));
-	cmd_impl->current_depth_stencil_attachment = VK_NULL_HANDLE;
-
-	cmd_impl->_is_in_render_pass = false;
+	reset_render_pass_state(cmd_impl);
 #endif
 }
 
@@ -2900,11 +2965,7 @@ void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer commandBuffer)
 	assert(cmd_impl->_is_in_render_pass);
 
 	reshade::invoke_addon_event<reshade::addon_event::end_render_pass>(cmd_impl);
-
-	std::memset(cmd_impl->current_color_attachments, 0, sizeof(cmd_impl->current_color_attachments));
-	cmd_impl->current_depth_stencil_attachment = VK_NULL_HANDLE;
-
-	cmd_impl->_is_in_render_pass = false;
+	reset_render_pass_state(cmd_impl);
 #endif
 
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(CmdEndRendering, device_impl);

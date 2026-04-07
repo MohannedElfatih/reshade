@@ -20,6 +20,7 @@
 namespace reshade::vulkan
 {
 	template <VkObjectType type> struct object_data;
+	bool allow_render_pass_to_dynamic_rendering(const GladVulkanContext &dispatch_table);
 
 	class command_list_impl;
 	class command_list_immediate_impl;
