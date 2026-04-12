@@ -170,6 +170,9 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 	VkPhysicalDeviceProperties physical_device_props;
 	instance.dispatch_table.GetPhysicalDeviceProperties(physicalDevice, &physical_device_props);
 	const bool dynamic_rendering_core = physical_device_props.apiVersion >= VK_API_VERSION_1_3;
+	const bool maintenance5_core = physical_device_props.apiVersion >= VK_API_VERSION_1_4;
+	const bool maintenance6_core = physical_device_props.apiVersion >= VK_API_VERSION_1_4;
+	const bool maintenance7_core = false;
 
 	uint32_t num_queue_families = 0;
 	enum_queue_families(physicalDevice, &num_queue_families, nullptr);
@@ -216,6 +219,9 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 	bool unified_image_layouts_ext = false;
 	bool custom_border_color_ext = false;
 	bool conservative_rasterization_ext = false;
+	bool maintenance5_ext = false;
+	bool maintenance6_ext = false;
+	bool maintenance7_ext = false;
 	bool ray_tracing_ext = false;
 
 	{
@@ -316,6 +322,15 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 #endif
 #if VK_EXT_conservative_rasterization
 		conservative_rasterization_ext = add_extension(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME, false);
+#endif
+#if VK_KHR_maintenance5
+		maintenance5_ext = maintenance5_core || add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME, false);
+#endif
+#if VK_KHR_maintenance6
+		maintenance6_ext = maintenance6_core || add_extension(VK_KHR_MAINTENANCE_6_EXTENSION_NAME, false);
+#endif
+#if VK_KHR_maintenance7
+		maintenance7_ext = maintenance7_core || add_extension(VK_KHR_MAINTENANCE_7_EXTENSION_NAME, false);
 #endif
 #if 0
 		ray_tracing_ext =
@@ -484,6 +499,9 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 
 	VkPhysicalDeviceHostImageCopyFeatures host_image_copy_features;
 	VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified_image_layouts_features;
+	VkPhysicalDeviceMaintenance5Features maintenance5_features;
+	VkPhysicalDeviceMaintenance6Features maintenance6_features;
+	VkPhysicalDeviceMaintenance7FeaturesKHR maintenance7_features;
 	VkPhysicalDeviceVulkan14Features vulkan_14_features;
 	if (const auto existing_vulkan_14_features = find_in_structure_chain<VkPhysicalDeviceVulkan14Features>(
 			pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES))
@@ -491,6 +509,10 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 		assert(instance.api_version >= VK_API_VERSION_1_4);
 
 		const_cast<VkPhysicalDeviceVulkan14Features *>(existing_vulkan_14_features)->pushDescriptor = VK_TRUE;
+		if (maintenance5_core || maintenance5_ext)
+			const_cast<VkPhysicalDeviceVulkan14Features *>(existing_vulkan_14_features)->maintenance5 = VK_TRUE;
+		if (maintenance6_core || maintenance6_ext)
+			const_cast<VkPhysicalDeviceVulkan14Features *>(existing_vulkan_14_features)->maintenance6 = VK_TRUE;
 		push_descriptor_ext = existing_vulkan_14_features->pushDescriptor;
 		host_image_copy_ext = existing_vulkan_14_features->hostImageCopy;
 	}
@@ -500,6 +522,8 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 		{
 			vulkan_14_features = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES, const_cast<void *>(create_info.pNext) };
 			vulkan_14_features.pushDescriptor = VK_TRUE;
+			vulkan_14_features.maintenance5 = (maintenance5_core || maintenance5_ext) ? VK_TRUE : VK_FALSE;
+			vulkan_14_features.maintenance6 = (maintenance6_core || maintenance6_ext) ? VK_TRUE : VK_FALSE;
 
 			create_info.pNext = &vulkan_14_features;
 			push_descriptor_ext = true;
@@ -516,6 +540,54 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 			host_image_copy_features.hostImageCopy = VK_TRUE;
 
 			create_info.pNext = &host_image_copy_features;
+		}
+
+		if (!maintenance5_core)
+		{
+			if (const auto existing_maintenance5_features = find_in_structure_chain<VkPhysicalDeviceMaintenance5Features>(
+					pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES))
+			{
+				maintenance5_ext = existing_maintenance5_features->maintenance5;
+			}
+			else if (maintenance5_ext)
+			{
+				maintenance5_features = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES, const_cast<void *>(create_info.pNext) };
+				maintenance5_features.maintenance5 = VK_TRUE;
+
+				create_info.pNext = &maintenance5_features;
+			}
+		}
+
+		if (!maintenance6_core)
+		{
+			if (const auto existing_maintenance6_features = find_in_structure_chain<VkPhysicalDeviceMaintenance6Features>(
+					pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES))
+			{
+				maintenance6_ext = existing_maintenance6_features->maintenance6;
+			}
+			else if (maintenance6_ext)
+			{
+				maintenance6_features = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES, const_cast<void *>(create_info.pNext) };
+				maintenance6_features.maintenance6 = VK_TRUE;
+
+				create_info.pNext = &maintenance6_features;
+			}
+		}
+
+		if (!maintenance7_core)
+		{
+			if (const auto existing_maintenance7_features = find_in_structure_chain<VkPhysicalDeviceMaintenance7FeaturesKHR>(
+					pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR))
+			{
+				maintenance7_ext = existing_maintenance7_features->maintenance7;
+			}
+			else if (maintenance7_ext)
+			{
+				maintenance7_features = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR, const_cast<void *>(create_info.pNext) };
+				maintenance7_features.maintenance7 = VK_TRUE;
+
+				create_info.pNext = &maintenance7_features;
+			}
 		}
 	}
 

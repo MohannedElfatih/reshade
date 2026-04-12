@@ -436,7 +436,8 @@ static bool signatures_match(
 {
 	if (a.color_count != b.color_count ||
 		a.depth_format != b.depth_format ||
-		a.stencil_format != b.stencil_format)
+		a.stencil_format != b.stencil_format ||
+		a.samples != b.samples)
 		return false;
 
 	for (uint32_t i = 0; i < a.color_count && i < 8; ++i)
@@ -446,6 +447,47 @@ static bool signatures_match(
 	}
 
 	return true;
+}
+
+static reshade::vulkan::object_data<VK_OBJECT_TYPE_PIPELINE>::rendering_signature extract_render_pass_signature(
+	const reshade::vulkan::device_impl *device_impl,
+	VkRenderPass render_pass,
+	uint32_t subpass_index)
+{
+	reshade::vulkan::object_data<VK_OBJECT_TYPE_PIPELINE>::rendering_signature signature = {};
+
+	const auto render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(render_pass);
+	if (render_pass_data == nullptr || subpass_index >= render_pass_data->subpasses.size())
+		return signature;
+
+	const auto &subpass = render_pass_data->subpasses[subpass_index];
+	signature.color_count = std::min(subpass.num_color_attachments, 8u);
+
+	for (uint32_t i = 0; i < signature.color_count; ++i)
+	{
+		const uint32_t a = subpass.color_attachments[i];
+		if (a != VK_ATTACHMENT_UNUSED && a < render_pass_data->attachments.size())
+		{
+			const auto &attachment = render_pass_data->attachments[a];
+			signature.color_formats[i] = attachment.format;
+			if (signature.samples == VK_SAMPLE_COUNT_1_BIT)
+				signature.samples = attachment.samples;
+		}
+	}
+
+	const uint32_t ds = subpass.depth_stencil_attachment;
+	if (ds != VK_ATTACHMENT_UNUSED && ds < render_pass_data->attachments.size())
+	{
+		const auto &attachment = render_pass_data->attachments[ds];
+		if ((reshade::vulkan::aspect_flags_from_format(attachment.format) & VK_IMAGE_ASPECT_DEPTH_BIT) != 0)
+			signature.depth_format = attachment.format;
+		if ((reshade::vulkan::aspect_flags_from_format(attachment.format) & VK_IMAGE_ASPECT_STENCIL_BIT) != 0)
+			signature.stencil_format = attachment.format;
+		if (signature.samples == VK_SAMPLE_COUNT_1_BIT)
+			signature.samples = attachment.samples;
+	}
+
+	return signature;
 }
 
 #if RESHADE_ADDON >= 2
@@ -853,15 +895,16 @@ void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindP
 					signature.color_formats[i] = cmd_impl->current_color_attachment_formats[i];
 				signature.depth_format = cmd_impl->current_depth_attachment_format;
 				signature.stencil_format = cmd_impl->current_stencil_attachment_format;
+				signature.samples = cmd_impl->current_rendering_samples;
 
 				const bool empty_signature =
 					signature.color_count == 0 &&
 					signature.depth_format == VK_FORMAT_UNDEFINED &&
 					signature.stencil_format == VK_FORMAT_UNDEFINED;
 
-				if (!empty_signature)
+				if (!empty_signature && !signatures_match(pipe_data->signature, signature))
 				{
-					// Lazily create clone matching current attachment formats
+					// Lazily create clone matching current attachment formats only when the current signature differs.
 					const VkPipeline clone = create_dynamic_rendering_clone(
 						device_impl,
 						pipe_data,
@@ -880,13 +923,19 @@ void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindP
 			auto *pipe_data =
 				device_impl->get_private_data_for_object<VK_OBJECT_TYPE_PIPELINE, true>(new_pipeline);
 
+			const auto current_signature =
+				extract_render_pass_signature(device_impl, cmd_impl->current_render_pass, pipe_data != nullptr ? pipe_data->captured_ci.subpass : 0);
+
 			if (pipe_data != nullptr &&
 				pipe_data->is_graphics &&
 				pipe_data->captured_ci.renderPass != VK_NULL_HANDLE &&
-				pipe_data->captured_ci.renderPass != cmd_impl->current_render_pass)
+				pipe_data->captured_ci.renderPass != cmd_impl->current_render_pass &&
+				!signatures_match(pipe_data->signature, current_signature))
 			{
 				// Always try to clone to the currently active render pass.
 				// If clone creation fails (e.g. incompatible), keep original pipeline bound.
+				// Matching signatures are already render-pass compatible, so avoid recreating
+				// pipelines from partially captured state just because the handle differs.
 				const VkPipeline clone = create_render_pass_clone(
 					device_impl,
 					pipe_data,
