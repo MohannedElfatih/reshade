@@ -455,11 +455,8 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 
 		create_info.pNext = &private_data_info;
 
-		dynamic_rendering_ext = dynamic_rendering_core || existing_vulkan_13_features->dynamicRendering;
+		dynamic_rendering_ext = existing_vulkan_13_features->dynamicRendering;
 
-		// Forcefully enable dynamic rendering in Vulkan 1.3 core if the physical device supports it.
-		if (dynamic_rendering_core)
-			const_cast<VkPhysicalDeviceVulkan13Features *>(existing_vulkan_13_features)->dynamicRendering = VK_TRUE;
 		// Forcefully enable private data in Vulkan 1.3, again, evil =)
 		const_cast<VkPhysicalDeviceVulkan13Features *>(existing_vulkan_13_features)->privateData = VK_TRUE;
 	}
@@ -483,17 +480,14 @@ VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevi
 		if (const auto existing_dynamic_rendering_features = find_in_structure_chain<VkPhysicalDeviceDynamicRenderingFeatures>(
 				pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES))
 		{
-			dynamic_rendering_ext = dynamic_rendering_core || existing_dynamic_rendering_features->dynamicRendering;
-			if (dynamic_rendering_core)
-				const_cast<VkPhysicalDeviceDynamicRenderingFeatures *>(existing_dynamic_rendering_features)->dynamicRendering = VK_TRUE;
+			dynamic_rendering_ext = existing_dynamic_rendering_features->dynamicRendering;
 		}
-		else if (dynamic_rendering_ext || dynamic_rendering_core)
+		else if (dynamic_rendering_ext)
 		{
 			dynamic_rendering_features = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, const_cast<void *>(create_info.pNext) };
 			dynamic_rendering_features.dynamicRendering = VK_TRUE;
 
 			create_info.pNext = &dynamic_rendering_features;
-			dynamic_rendering_ext = true;
 		}
 	}
 

@@ -102,7 +102,7 @@ void reshade::vulkan::command_list_impl::begin_render_pass(uint32_t count, const
 	_is_in_render_pass = true;
 
 #if VK_KHR_dynamic_rendering
-	if (reshade::vulkan::allow_render_pass_to_dynamic_rendering(vk))
+	if (vk.KHR_dynamic_rendering)
 	{
 		VkRenderingInfo rendering_info { VK_STRUCTURE_TYPE_RENDERING_INFO };
 		rendering_info.renderArea.extent.width = std::numeric_limits<uint32_t>::max();
@@ -341,7 +341,7 @@ void reshade::vulkan::command_list_impl::end_render_pass()
 	_is_in_render_pass = false;
 
 #if VK_KHR_dynamic_rendering
-	if (reshade::vulkan::allow_render_pass_to_dynamic_rendering(vk))
+	if (vk.KHR_dynamic_rendering)
 	{
 		vk.CmdEndRendering(_orig);
 	}
@@ -876,7 +876,7 @@ void reshade::vulkan::command_list_impl::resolve_texture_region(api::resource sr
 	else
 	{
 #if VK_KHR_dynamic_rendering
-		if (!reshade::vulkan::allow_render_pass_to_dynamic_rendering(vk) || _is_in_render_pass ||
+		if (!vk.KHR_dynamic_rendering || _is_in_render_pass ||
 			src_data->default_view == VK_NULL_HANDLE || dst_data->default_view == VK_NULL_HANDLE)
 		{
 			assert(false);
