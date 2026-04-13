@@ -42,8 +42,8 @@ namespace
 	{
 		size_t operator()(const shader_module_key &key) const
 		{
-			const size_t h1 = std::hash<uint64_t>()(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(key.device)));
-			const size_t h2 = std::hash<uint64_t>()(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(key.module)));
+			const size_t h1 = std::hash<VkDevice>()(key.device);
+			const size_t h2 = std::hash<VkShaderModule>()(key.module);
 			return h1 ^ (h2 + 0x9e3779b97f4a7c15ull + (h1 << 6) + (h1 >> 2));
 		}
 	};
@@ -3051,8 +3051,106 @@ void     VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevice device, VkDescrip
 	trampoline(device, descriptorSet, descriptorUpdateTemplate, pData);
 }
 
-VkRenderPass create_cloned_render_pass_for_framebuffer(
+static bool get_render_pass_attachment_format_key(
 	reshade::vulkan::device_impl *device_impl,
+	VkRenderPass render_pass,
+	uint32_t attachment_count,
+	const VkImageView *attachments,
+	std::vector<VkFormat> &out_format_key)
+{
+	const auto render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(render_pass);
+	if (render_pass_data == nullptr)
+		return false;
+
+	const VkRenderPass original_render_pass =
+		(render_pass_data->original_render_pass != VK_NULL_HANDLE) ? render_pass_data->original_render_pass : render_pass;
+	auto *original_render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(original_render_pass);
+	if (original_render_pass_data == nullptr)
+		original_render_pass_data = render_pass_data;
+
+	if (attachment_count == 0 || attachments == nullptr || original_render_pass_data->attachments.empty() || original_render_pass_data->subpasses.empty())
+		return false;
+
+	out_format_key.clear();
+	out_format_key.reserve(original_render_pass_data->attachments.size());
+	for (const VkAttachmentDescription &attachment : original_render_pass_data->attachments)
+		out_format_key.push_back(attachment.format);
+
+	bool has_format_mismatch = false;
+	const uint32_t max_attachments = std::min<uint32_t>(attachment_count, static_cast<uint32_t>(out_format_key.size()));
+	for (uint32_t i = 0; i < max_attachments; ++i)
+	{
+		const auto view_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE_VIEW, true>(attachments[i]);
+		if (view_data == nullptr || view_data->create_info.sType != VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+			continue;
+
+		const VkFormat new_format = view_data->create_info.format;
+		if (new_format != VK_FORMAT_UNDEFINED && out_format_key[i] != new_format)
+		{
+			out_format_key[i] = new_format;
+			has_format_mismatch = true;
+		}
+	}
+
+	return has_format_mismatch;
+}
+
+VkRenderPass reshade::vulkan::get_compatible_render_pass_for_framebuffer(
+	device_impl *device_impl,
+	object_data<VK_OBJECT_TYPE_FRAMEBUFFER> *framebuffer_data,
+	VkRenderPass render_pass,
+	uint32_t attachment_count,
+	const VkImageView *attachments,
+	const VkAllocationCallbacks *allocator)
+{
+	if (framebuffer_data == nullptr || render_pass == VK_NULL_HANDLE)
+		return VK_NULL_HANDLE;
+
+	if (framebuffer_data->render_pass == render_pass)
+		return render_pass;
+
+	std::vector<VkFormat> format_key;
+	if (!get_render_pass_attachment_format_key(device_impl, render_pass, attachment_count, attachments, format_key))
+		return VK_NULL_HANDLE;
+
+	{
+		const std::lock_guard<std::mutex> lock(*framebuffer_data->compatible_render_pass_mutex);
+		for (const auto &entry : framebuffer_data->compatible_render_passes)
+		{
+			if (entry.render_pass == render_pass && entry.format_key == format_key)
+				return entry.compatible_render_pass;
+		}
+	}
+
+	const VkRenderPass compatible_render_pass = create_cloned_render_pass_for_framebuffer(
+		device_impl,
+		render_pass,
+		attachment_count,
+		attachments,
+		allocator);
+	if (compatible_render_pass == VK_NULL_HANDLE)
+		return VK_NULL_HANDLE;
+
+	{
+		const std::lock_guard<std::mutex> lock(*framebuffer_data->compatible_render_pass_mutex);
+		for (const auto &entry : framebuffer_data->compatible_render_passes)
+		{
+			if (entry.render_pass == render_pass && entry.format_key == format_key)
+				return entry.compatible_render_pass;
+		}
+
+		reshade::vulkan::object_data<VK_OBJECT_TYPE_FRAMEBUFFER>::compatible_render_pass_entry entry;
+		entry.render_pass = render_pass;
+		entry.format_key = std::move(format_key);
+		entry.compatible_render_pass = compatible_render_pass;
+		framebuffer_data->compatible_render_passes.push_back(std::move(entry));
+	}
+
+	return compatible_render_pass;
+}
+
+VkRenderPass reshade::vulkan::create_cloned_render_pass_for_framebuffer(
+	device_impl *device_impl,
 	VkRenderPass render_pass,
 	uint32_t attachment_count,
 	const VkImageView *attachments,
@@ -3287,8 +3385,12 @@ VkResult VKAPI_CALL vkCreateFramebuffer(VkDevice device, const VkFramebufferCrea
 
 				if (has_format_mismatch)
 				{
-					VkRenderPass cloned_render_pass = create_cloned_render_pass_for_framebuffer(
+					reshade::vulkan::object_data<VK_OBJECT_TYPE_FRAMEBUFFER> framebuffer_data;
+					framebuffer_data.attachments.assign(create_info_copy.pAttachments, create_info_copy.pAttachments + create_info_copy.attachmentCount);
+
+					VkRenderPass cloned_render_pass = get_compatible_render_pass_for_framebuffer(
 						device_impl,
+						&framebuffer_data,
 						pCreateInfo->renderPass,
 						create_info_copy.attachmentCount,
 						create_info_copy.pAttachments,
@@ -3330,6 +3432,18 @@ VkResult VKAPI_CALL vkCreateFramebuffer(VkDevice device, const VkFramebufferCrea
 		data.attachments.assign(create_info->pAttachments, create_info->pAttachments + create_info->attachmentCount);
 	}
 	data.render_pass = create_info->renderPass;
+	if (pCreateInfo->renderPass != VK_NULL_HANDLE && create_info->renderPass != VK_NULL_HANDLE)
+	{
+		std::vector<VkFormat> format_key;
+		if (get_render_pass_attachment_format_key(device_impl, pCreateInfo->renderPass, create_info->attachmentCount, create_info->pAttachments, format_key))
+		{
+			reshade::vulkan::object_data<VK_OBJECT_TYPE_FRAMEBUFFER>::compatible_render_pass_entry entry;
+			entry.render_pass = pCreateInfo->renderPass;
+			entry.format_key = std::move(format_key);
+			entry.compatible_render_pass = create_info->renderPass;
+			data.compatible_render_passes.push_back(std::move(entry));
+		}
+	}
 #endif
 
 	return result;

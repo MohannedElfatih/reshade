@@ -55,7 +55,14 @@ struct vulkan_instance
 
 namespace reshade::vulkan
 {
+	class device_impl;
+
+	template <VkObjectType type>
+	struct object_data;
+
 	bool is_tracked_shader_module_alive(VkDevice device, VkShaderModule shader_module);
+	VkRenderPass create_cloned_render_pass_for_framebuffer(device_impl *device_impl, VkRenderPass render_pass, uint32_t attachment_count, const VkImageView *attachments, const VkAllocationCallbacks *allocator);
+	VkRenderPass get_compatible_render_pass_for_framebuffer(device_impl *device_impl, object_data<VK_OBJECT_TYPE_FRAMEBUFFER> *framebuffer_data, VkRenderPass render_pass, uint32_t attachment_count, const VkImageView *attachments, const VkAllocationCallbacks *allocator);
 }
 
 #define RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(name, device) \

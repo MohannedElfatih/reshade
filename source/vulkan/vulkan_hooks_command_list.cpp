@@ -16,13 +16,6 @@
 
 extern lockfree_linear_map<void *, reshade::vulkan::device_impl *, 8> g_vulkan_devices;
 
-VkRenderPass create_cloned_render_pass_for_framebuffer(
-	reshade::vulkan::device_impl *device_impl,
-	VkRenderPass render_pass,
-	uint32_t attachment_count,
-	const VkImageView *attachments,
-	const VkAllocationCallbacks *allocator);
-
 #if RESHADE_ADDON
 bool reshade::vulkan::allow_render_pass_to_dynamic_rendering(const GladVulkanContext &dispatch_table)
 {
@@ -2100,8 +2093,9 @@ void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRend
 					attachments != nullptr && !framebuffer_data->attachments.empty())
 				{
 					// Clone the begin render pass for the framebuffer attachments and use that clone.
-					const VkRenderPass cloned_begin_render_pass = create_cloned_render_pass_for_framebuffer(
+					const VkRenderPass cloned_begin_render_pass = reshade::vulkan::get_compatible_render_pass_for_framebuffer(
 						device_impl,
+						framebuffer_data,
 						pRenderPassBegin->renderPass,
 						static_cast<uint32_t>(framebuffer_data->attachments.size()),
 						attachments,
@@ -2437,8 +2431,9 @@ void VKAPI_CALL vkCmdBeginRenderPass2(VkCommandBuffer commandBuffer, const VkRen
 					attachments != nullptr && !framebuffer_data->attachments.empty())
 				{
 					// Clone the begin render pass for the framebuffer attachments and use that clone.
-					const VkRenderPass cloned_begin_render_pass = create_cloned_render_pass_for_framebuffer(
+					const VkRenderPass cloned_begin_render_pass = reshade::vulkan::get_compatible_render_pass_for_framebuffer(
 						device_impl,
+						framebuffer_data,
 						pRenderPassBegin->renderPass,
 						static_cast<uint32_t>(framebuffer_data->attachments.size()),
 						attachments,
