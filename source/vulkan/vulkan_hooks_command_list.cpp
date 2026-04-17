@@ -291,6 +291,48 @@ static void invoke_begin_render_pass_event(reshade::vulkan::object_data<VK_OBJEC
 
 	reshade::invoke_addon_event<reshade::addon_event::begin_render_pass>(cmd_impl, rendering_info->colorAttachmentCount, rts.p, rendering_info->pDepthAttachment != nullptr || rendering_info->pStencilAttachment != nullptr ? &ds : nullptr);
 }
+
+static void invoke_bind_render_targets_and_depth_stencil_event_for_rendering_info(
+	reshade::vulkan::object_data<VK_OBJECT_TYPE_COMMAND_BUFFER> *cmd_impl,
+	VkRenderingInfo *rendering_info)
+{
+	if (rendering_info == nullptr || !reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
+		return;
+
+	temp_mem<reshade::api::resource_view, 8> rtvs(rendering_info->colorAttachmentCount);
+	for (uint32_t i = 0; i < rendering_info->colorAttachmentCount; ++i)
+		rtvs[i] = { (uint64_t)rendering_info->pColorAttachments[i].imageView };
+
+	const VkImageView original_depth_view =
+		(rendering_info->pDepthAttachment != nullptr) ? rendering_info->pDepthAttachment->imageView : VK_NULL_HANDLE;
+	const VkImageView original_stencil_view =
+		(rendering_info->pStencilAttachment != nullptr) ? rendering_info->pStencilAttachment->imageView : VK_NULL_HANDLE;
+
+	reshade::api::resource_view dsv = { 0 };
+	if (rendering_info->pDepthAttachment != nullptr)
+		dsv = { (uint64_t)original_depth_view };
+
+	reshade::invoke_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+		cmd_impl, rendering_info->colorAttachmentCount, static_cast<const reshade::api::resource_view *>(rtvs.p), dsv);
+
+	for (uint32_t i = 0; i < rendering_info->colorAttachmentCount; ++i)
+		const_cast<VkRenderingAttachmentInfo &>(rendering_info->pColorAttachments[i]).imageView = (VkImageView)rtvs[i].handle;
+
+	if (rendering_info->pDepthAttachment != nullptr)
+	{
+		auto &depth_attachment = const_cast<VkRenderingAttachmentInfo &>(*rendering_info->pDepthAttachment);
+		depth_attachment.imageView = (VkImageView)dsv.handle;
+
+		if (rendering_info->pStencilAttachment != nullptr &&
+			original_depth_view != VK_NULL_HANDLE &&
+			original_depth_view == original_stencil_view &&
+			depth_attachment.imageView != original_depth_view)
+		{
+			auto &stencil_attachment = const_cast<VkRenderingAttachmentInfo &>(*rendering_info->pStencilAttachment);
+			stencil_attachment.imageView = depth_attachment.imageView;
+		}
+	}
+}
 #endif
 
 #if RESHADE_ADDON >= 2
@@ -1985,6 +2027,133 @@ const VkImageView *resolve_render_pass_attachments(
 	return fb_data->attachments.data(); // adjust if your type differs
 }
 
+static bool invoke_bind_render_targets_and_depth_stencil_event(
+	reshade::vulkan::device_impl *device_impl,
+	reshade::vulkan::object_data<VK_OBJECT_TYPE_COMMAND_BUFFER> *cmd_impl,
+	const VkRenderPassBeginInfo *begin_info,
+	VkRenderPassBeginInfo &begin_info_copy,
+	VkRenderPassAttachmentBeginInfo &attachment_begin_info_copy,
+	std::vector<VkImageView> &attachment_storage)
+{
+	if (begin_info == nullptr)
+		return false;
+
+	const auto render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(begin_info->renderPass);
+	if (render_pass_data == nullptr || render_pass_data->subpasses.empty())
+		return false;
+
+	const auto &subpass = render_pass_data->subpasses[0];
+	const auto framebuffer_data = (begin_info->framebuffer != VK_NULL_HANDLE) ?
+		device_impl->get_private_data_for_object<VK_OBJECT_TYPE_FRAMEBUFFER, true>(begin_info->framebuffer) :
+		nullptr;
+	const auto attachment_begin_info =
+		find_in_structure_chain<VkRenderPassAttachmentBeginInfo>(
+			begin_info, VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO);
+
+	if (attachment_begin_info != nullptr && attachment_begin_info->attachmentCount != 0 && attachment_begin_info->pAttachments != nullptr)
+		attachment_storage.assign(attachment_begin_info->pAttachments, attachment_begin_info->pAttachments + attachment_begin_info->attachmentCount);
+	else if (framebuffer_data != nullptr && !framebuffer_data->attachments.empty())
+		attachment_storage = framebuffer_data->attachments;
+	else
+		return false;
+
+	temp_mem<reshade::api::resource_view, 8> rtvs(subpass.num_color_attachments);
+	for (uint32_t i = 0; i < subpass.num_color_attachments; ++i)
+	{
+		const uint32_t attachment_index = subpass.color_attachments[i];
+		rtvs[i] =
+			(attachment_index != VK_ATTACHMENT_UNUSED && attachment_index < attachment_storage.size()) ?
+				reshade::api::resource_view { (uint64_t)attachment_storage[attachment_index] } :
+				reshade::api::resource_view {};
+	}
+
+	const uint32_t ds_attachment_index = subpass.depth_stencil_attachment;
+	reshade::api::resource_view dsv =
+		(ds_attachment_index != VK_ATTACHMENT_UNUSED && ds_attachment_index < attachment_storage.size()) ?
+			reshade::api::resource_view { (uint64_t)attachment_storage[ds_attachment_index] } :
+			reshade::api::resource_view {};
+
+	reshade::invoke_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+		cmd_impl, subpass.num_color_attachments, static_cast<const reshade::api::resource_view *>(rtvs.p), dsv);
+
+	bool attachments_changed = false;
+	for (uint32_t i = 0; i < subpass.num_color_attachments; ++i)
+	{
+		const uint32_t attachment_index = subpass.color_attachments[i];
+		if (attachment_index == VK_ATTACHMENT_UNUSED || attachment_index >= attachment_storage.size())
+			continue;
+
+		const VkImageView view = (VkImageView)rtvs[i].handle;
+		if (attachment_storage[attachment_index] != view)
+		{
+			attachment_storage[attachment_index] = view;
+			attachments_changed = true;
+		}
+	}
+	if (ds_attachment_index != VK_ATTACHMENT_UNUSED && ds_attachment_index < attachment_storage.size())
+	{
+		const VkImageView view = (VkImageView)dsv.handle;
+		if (attachment_storage[ds_attachment_index] != view)
+		{
+			attachment_storage[ds_attachment_index] = view;
+			attachments_changed = true;
+		}
+	}
+
+	VkRenderPass target_render_pass = begin_info->renderPass;
+	if (framebuffer_data != nullptr)
+	{
+		if (const VkRenderPass compatible_render_pass = reshade::vulkan::get_compatible_render_pass_for_framebuffer(
+				device_impl,
+				framebuffer_data,
+				begin_info->renderPass,
+				static_cast<uint32_t>(attachment_storage.size()),
+				attachment_storage.data(),
+				nullptr);
+			compatible_render_pass != VK_NULL_HANDLE)
+			target_render_pass = compatible_render_pass;
+	}
+
+	if (!attachments_changed && target_render_pass == begin_info->renderPass)
+		return false;
+
+	begin_info_copy = *begin_info;
+	begin_info_copy.renderPass = target_render_pass;
+
+	if (attachment_begin_info != nullptr)
+	{
+		if (!attachments_changed)
+			return true;
+
+		if (begin_info->pNext != attachment_begin_info)
+			return false;
+
+		attachment_begin_info_copy = *attachment_begin_info;
+		attachment_begin_info_copy.pAttachments = attachment_storage.data();
+		begin_info_copy.pNext = &attachment_begin_info_copy;
+		return true;
+	}
+
+	if (!attachments_changed)
+		return true;
+
+	if (framebuffer_data == nullptr)
+		return false;
+
+	const VkFramebuffer compatible_framebuffer = reshade::vulkan::get_compatible_framebuffer_for_render_pass(
+		device_impl,
+		framebuffer_data,
+		target_render_pass,
+		static_cast<uint32_t>(attachment_storage.size()),
+		attachment_storage.data(),
+		nullptr);
+	if (compatible_framebuffer == VK_NULL_HANDLE)
+		return false;
+
+	begin_info_copy.framebuffer = compatible_framebuffer;
+	return true;
+}
+
 void build_reshade_render_pass_descs(
 	reshade::vulkan::device_impl *device_impl,
 	const VkRenderPassBeginInfo *begin_info,
@@ -2078,40 +2247,14 @@ void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRend
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	VkRenderPassBeginInfo begin_info_copy = {};
+	VkRenderPassAttachmentBeginInfo attachment_begin_info_copy { VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO };
+	std::vector<VkImageView> attachment_storage;
 
 #if RESHADE_ADDON
-	if (reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
-	{
-		if (pRenderPassBegin != nullptr && pRenderPassBegin->framebuffer != VK_NULL_HANDLE)
-		{
-			if (const auto framebuffer_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_FRAMEBUFFER, true>(pRenderPassBegin->framebuffer);
-				framebuffer_data != nullptr &&
-				framebuffer_data->render_pass != VK_NULL_HANDLE &&
-				framebuffer_data->render_pass != pRenderPassBegin->renderPass)
-			{
-				if (const VkImageView *const attachments = resolve_render_pass_attachments(device_impl, pRenderPassBegin);
-					attachments != nullptr && !framebuffer_data->attachments.empty())
-				{
-					// Clone the begin render pass for the framebuffer attachments and use that clone.
-					const VkRenderPass cloned_begin_render_pass = reshade::vulkan::get_compatible_render_pass_for_framebuffer(
-						device_impl,
-						framebuffer_data,
-						pRenderPassBegin->renderPass,
-						static_cast<uint32_t>(framebuffer_data->attachments.size()),
-						attachments,
-						nullptr);
-					if (cloned_begin_render_pass != VK_NULL_HANDLE)
-					{
-						begin_info_copy = *pRenderPassBegin;
-						begin_info_copy.renderPass = cloned_begin_render_pass;
-						pRenderPassBegin = &begin_info_copy;
-					}
-				}
-			}
-		}
-	}
-
 	const auto cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+	if (reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>() &&
+		invoke_bind_render_targets_and_depth_stencil_event(device_impl, cmd_impl, pRenderPassBegin, begin_info_copy, attachment_begin_info_copy, attachment_storage))
+		pRenderPassBegin = &begin_info_copy;
 
 	assert(!cmd_impl->_is_in_render_pass);
 	assert(cmd_impl->current_render_pass == VK_NULL_HANDLE);
@@ -2256,6 +2399,8 @@ void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRend
 		rendering_info.pColorAttachments = color_attachments.p;
 		rendering_info.pDepthAttachment = depth_ptr;
 		rendering_info.pStencilAttachment = stencil_ptr;
+
+		invoke_bind_render_targets_and_depth_stencil_event_for_rendering_info(cmd_impl, &rendering_info);
 
 		RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(CmdBeginRendering, device_impl);
 		device_impl->_dispatch_table.CmdBeginRendering(commandBuffer, &rendering_info);
@@ -2416,40 +2561,14 @@ void VKAPI_CALL vkCmdBeginRenderPass2(VkCommandBuffer commandBuffer, const VkRen
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	VkRenderPassBeginInfo begin_info_copy = {};
+	VkRenderPassAttachmentBeginInfo attachment_begin_info_copy { VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO };
+	std::vector<VkImageView> attachment_storage;
 
 #if RESHADE_ADDON
-	if (reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
-	{
-		if (pRenderPassBegin != nullptr && pRenderPassBegin->framebuffer != VK_NULL_HANDLE)
-		{
-			if (const auto framebuffer_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_FRAMEBUFFER, true>(pRenderPassBegin->framebuffer);
-				framebuffer_data != nullptr &&
-				framebuffer_data->render_pass != VK_NULL_HANDLE &&
-				framebuffer_data->render_pass != pRenderPassBegin->renderPass)
-			{
-				if (const VkImageView *const attachments = resolve_render_pass_attachments(device_impl, pRenderPassBegin);
-					attachments != nullptr && !framebuffer_data->attachments.empty())
-				{
-					// Clone the begin render pass for the framebuffer attachments and use that clone.
-					const VkRenderPass cloned_begin_render_pass = reshade::vulkan::get_compatible_render_pass_for_framebuffer(
-						device_impl,
-						framebuffer_data,
-						pRenderPassBegin->renderPass,
-						static_cast<uint32_t>(framebuffer_data->attachments.size()),
-						attachments,
-						nullptr);
-					if (cloned_begin_render_pass != VK_NULL_HANDLE)
-					{
-						begin_info_copy = *pRenderPassBegin;
-						begin_info_copy.renderPass = cloned_begin_render_pass;
-						pRenderPassBegin = &begin_info_copy;
-					}
-				}
-			}
-		}
-	}
-
 	const auto cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+	if (reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>() &&
+		invoke_bind_render_targets_and_depth_stencil_event(device_impl, cmd_impl, pRenderPassBegin, begin_info_copy, attachment_begin_info_copy, attachment_storage))
+		pRenderPassBegin = &begin_info_copy;
 
 	assert(!cmd_impl->_is_in_render_pass);
 	assert(cmd_impl->current_render_pass == VK_NULL_HANDLE);
@@ -2956,6 +3075,8 @@ void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer commandBuffer, const VkRende
 	}
 
 	assert(!cmd_impl->_is_in_render_pass);
+
+	invoke_bind_render_targets_and_depth_stencil_event_for_rendering_info(cmd_impl, &rendering_info_copy);
 
 	invoke_begin_render_pass_event(cmd_impl, &rendering_info_copy);
 

@@ -3106,12 +3106,27 @@ VkRenderPass reshade::vulkan::get_compatible_render_pass_for_framebuffer(
 	if (framebuffer_data == nullptr || render_pass == VK_NULL_HANDLE)
 		return VK_NULL_HANDLE;
 
-	if (framebuffer_data->render_pass == render_pass)
-		return render_pass;
-
 	std::vector<VkFormat> format_key;
 	if (!get_render_pass_attachment_format_key(device_impl, render_pass, attachment_count, attachments, format_key))
 		return VK_NULL_HANDLE;
+
+	const auto render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS, true>(render_pass);
+	if (render_pass_data != nullptr &&
+		render_pass_data->attachments.size() == format_key.size())
+	{
+		bool matches_render_pass = true;
+		for (size_t i = 0; i < format_key.size(); ++i)
+		{
+			if (render_pass_data->attachments[i].format != format_key[i])
+			{
+				matches_render_pass = false;
+				break;
+			}
+		}
+
+		if (matches_render_pass)
+			return render_pass;
+	}
 
 	{
 		const std::lock_guard<std::mutex> lock(*framebuffer_data->compatible_render_pass_mutex);
@@ -3147,6 +3162,72 @@ VkRenderPass reshade::vulkan::get_compatible_render_pass_for_framebuffer(
 	}
 
 	return compatible_render_pass;
+}
+
+VkFramebuffer reshade::vulkan::get_compatible_framebuffer_for_render_pass(
+	device_impl *device_impl,
+	object_data<VK_OBJECT_TYPE_FRAMEBUFFER> *framebuffer_data,
+	VkRenderPass render_pass,
+	uint32_t attachment_count,
+	const VkImageView *attachments,
+	const VkAllocationCallbacks *allocator)
+{
+	if (framebuffer_data == nullptr || render_pass == VK_NULL_HANDLE || attachment_count == 0 || attachments == nullptr)
+		return VK_NULL_HANDLE;
+
+	std::vector<VkImageView> attachment_key(attachments, attachments + attachment_count);
+
+	{
+		const std::lock_guard<std::mutex> lock(*framebuffer_data->compatible_framebuffer_mutex);
+		for (const auto &entry : framebuffer_data->compatible_framebuffers)
+		{
+			if (entry.render_pass == render_pass && entry.attachments == attachment_key)
+				return entry.compatible_framebuffer;
+		}
+	}
+
+	VkFramebufferCreateInfo create_info { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+	create_info.flags = framebuffer_data->flags & ~VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT;
+	create_info.renderPass = render_pass;
+	create_info.attachmentCount = attachment_count;
+	create_info.pAttachments = attachments;
+	create_info.width = framebuffer_data->width;
+	create_info.height = framebuffer_data->height;
+	create_info.layers = framebuffer_data->layers;
+
+	VkFramebuffer compatible_framebuffer = VK_NULL_HANDLE;
+	const VkResult result = device_impl->_dispatch_table.CreateFramebuffer(device_impl->_orig, &create_info, allocator, &compatible_framebuffer);
+	if (result < VK_SUCCESS)
+		return VK_NULL_HANDLE;
+
+	{
+		const std::lock_guard<std::mutex> lock(*framebuffer_data->compatible_framebuffer_mutex);
+		for (const auto &entry : framebuffer_data->compatible_framebuffers)
+		{
+			if (entry.render_pass == render_pass && entry.attachments == attachment_key)
+			{
+				device_impl->_dispatch_table.DestroyFramebuffer(device_impl->_orig, compatible_framebuffer, allocator);
+				return entry.compatible_framebuffer;
+			}
+		}
+
+		auto &data = *device_impl->register_object<VK_OBJECT_TYPE_FRAMEBUFFER>(compatible_framebuffer);
+		data.attachments = attachment_key;
+		data.render_pass = render_pass;
+		data.flags = create_info.flags;
+		data.attachment_count = create_info.attachmentCount;
+		data.width = create_info.width;
+		data.height = create_info.height;
+		data.layers = create_info.layers;
+
+		reshade::vulkan::object_data<VK_OBJECT_TYPE_FRAMEBUFFER>::compatible_framebuffer_entry entry;
+		entry.render_pass = render_pass;
+		entry.attachments = std::move(attachment_key);
+		entry.compatible_framebuffer = compatible_framebuffer;
+		framebuffer_data->compatible_framebuffers.push_back(std::move(entry));
+	}
+
+	return compatible_framebuffer;
 }
 
 VkRenderPass reshade::vulkan::create_cloned_render_pass_for_framebuffer(
@@ -3320,49 +3401,7 @@ VkResult VKAPI_CALL vkCreateFramebuffer(VkDevice device, const VkFramebufferCrea
 		std::copy_n(pCreateInfo->pAttachments, pCreateInfo->attachmentCount, attachment_storage.p);
 
 #if RESHADE_ADDON
-		if (render_pass_data != nullptr &&
-			!render_pass_data->subpasses.empty() &&
-			reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
-		{
-			const auto &subpass = render_pass_data->subpasses[0];
-			temp_mem<reshade::api::resource_view, 8> rtvs(subpass.num_color_attachments);
-			temp_mem<uint32_t, 8> color_attachment_indices(subpass.num_color_attachments);
-
-			for (uint32_t a = 0; a < subpass.num_color_attachments; ++a)
-			{
-				const uint32_t attachment_index = subpass.color_attachments[a];
-				color_attachment_indices[a] = attachment_index;
-				rtvs[a] = (attachment_index != VK_ATTACHMENT_UNUSED && attachment_index < pCreateInfo->attachmentCount) ?
-					reshade::api::resource_view { (uint64_t)attachment_storage[attachment_index] } :
-					reshade::api::resource_view {};
-			}
-
-			const uint32_t ds_attachment_index = subpass.depth_stencil_attachment;
-			reshade::api::resource_view dsv =
-				(ds_attachment_index != VK_ATTACHMENT_UNUSED && ds_attachment_index < pCreateInfo->attachmentCount) ?
-					reshade::api::resource_view { (uint64_t)attachment_storage[ds_attachment_index] } :
-					reshade::api::resource_view {};
-
-			if (const auto immediate_command_list = device_impl->get_immediate_command_list();
-				immediate_command_list != nullptr)
-			{
-				// This event is used as a mutable hook for Vulkan framebuffer attachment overrides in this path.
-				reshade::invoke_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
-					immediate_command_list, subpass.num_color_attachments, static_cast<const reshade::api::resource_view *>(rtvs.p), dsv);
-			}
-
-			for (uint32_t a = 0; a < subpass.num_color_attachments; ++a)
-			{
-				const uint32_t attachment_index = color_attachment_indices[a];
-				if (attachment_index != VK_ATTACHMENT_UNUSED && attachment_index < pCreateInfo->attachmentCount)
-					attachment_storage[attachment_index] = (VkImageView)rtvs[a].handle;
-			}
-
-			if (ds_attachment_index != VK_ATTACHMENT_UNUSED && ds_attachment_index < pCreateInfo->attachmentCount)
-				attachment_storage[ds_attachment_index] = (VkImageView)dsv.handle;
-		}
-
-		if(reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
+		if (reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>())
 		{
 			create_info_copy.pAttachments = attachment_storage.p;
 
@@ -3422,6 +3461,11 @@ VkResult VKAPI_CALL vkCreateFramebuffer(VkDevice device, const VkFramebufferCrea
 #if RESHADE_ADDON
 	// Keep track of the frame buffer attachments
 	reshade::vulkan::object_data<VK_OBJECT_TYPE_FRAMEBUFFER> &data = *device_impl->register_object<VK_OBJECT_TYPE_FRAMEBUFFER>(*pFramebuffer);
+	data.flags = create_info->flags;
+	data.attachment_count = create_info->attachmentCount;
+	data.width = create_info->width;
+	data.height = create_info->height;
+	data.layers = create_info->layers;
 	if ((create_info->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) != 0)
 	{
 		data.attachments.resize(create_info->attachmentCount);
@@ -3457,6 +3501,19 @@ void     VKAPI_CALL vkDestroyFramebuffer(VkDevice device, VkFramebuffer framebuf
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(DestroyFramebuffer, device_impl);
 
 #if RESHADE_ADDON
+	if (auto *const framebuffer_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_FRAMEBUFFER>(framebuffer);
+		framebuffer_data != nullptr)
+	{
+		for (const auto &entry : framebuffer_data->compatible_framebuffers)
+		{
+			if (entry.compatible_framebuffer == VK_NULL_HANDLE)
+				continue;
+
+			device_impl->unregister_object<VK_OBJECT_TYPE_FRAMEBUFFER>(entry.compatible_framebuffer);
+			device_impl->_dispatch_table.DestroyFramebuffer(device_impl->_orig, entry.compatible_framebuffer, pAllocator);
+		}
+	}
+
 	device_impl->unregister_object<VK_OBJECT_TYPE_FRAMEBUFFER>(framebuffer);
 #endif
 

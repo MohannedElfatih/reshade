@@ -132,11 +132,24 @@ namespace reshade::vulkan
 			std::vector<VkFormat> format_key;
 			VkRenderPass compatible_render_pass = VK_NULL_HANDLE;
 		};
+		struct compatible_framebuffer_entry
+		{
+			VkRenderPass render_pass = VK_NULL_HANDLE;
+			std::vector<VkImageView> attachments;
+			VkFramebuffer compatible_framebuffer = VK_NULL_HANDLE;
+		};
 
 		std::vector<VkImageView> attachments;
 		VkRenderPass render_pass = VK_NULL_HANDLE;
+		VkFramebufferCreateFlags flags = 0;
+		uint32_t attachment_count = 0;
+		uint32_t width = 0;
+		uint32_t height = 0;
+		uint32_t layers = 0;
 		std::vector<compatible_render_pass_entry> compatible_render_passes;
 		std::unique_ptr<std::mutex> compatible_render_pass_mutex = std::make_unique<std::mutex>();
+		std::vector<compatible_framebuffer_entry> compatible_framebuffers;
+		std::unique_ptr<std::mutex> compatible_framebuffer_mutex = std::make_unique<std::mutex>();
 	};
 
 	template <>
