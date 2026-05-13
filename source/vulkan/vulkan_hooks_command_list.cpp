@@ -26,8 +26,11 @@ bool reshade::vulkan::allow_render_pass_to_dynamic_rendering(const GladVulkanCon
 	if (!dispatch_table.KHR_dynamic_rendering)
 		return false;
 
-	bool enabled = false;
-	reshade::global_config().get("VULKAN", "AllowRenderPassToDynamicRendering", enabled);
+	static const bool enabled = []() {
+		bool value = false;
+		reshade::global_config().get("VULKAN", "AllowRenderPassToDynamicRendering", value);
+		return value;
+	}();
 	return enabled;
 #endif
 }
@@ -347,10 +350,12 @@ VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer commandBuffer, const Vk
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	const VkCommandBufferBeginInfo *begin_info = pBeginInfo;
+#if RESHADE_ADDON
 	VkCommandBufferBeginInfo begin_info_copy = {};
 	VkCommandBufferInheritanceInfo inheritance_info_copy = {};
 
-	if (pBeginInfo != nullptr &&
+	if (reshade::has_addon_event<reshade::addon_event::bind_render_targets_and_depth_stencil>() &&
+		pBeginInfo != nullptr &&
 		pBeginInfo->pInheritanceInfo != nullptr &&
 		(pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) != 0)
 	{
@@ -373,8 +378,6 @@ VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer commandBuffer, const Vk
 			}
 		}
 	}
-
-#if RESHADE_ADDON
 	const auto cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
 	// Begin does perform an implicit reset if command pool was created with 'VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT'
@@ -1767,32 +1770,9 @@ void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImag
 void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer commandBuffer, VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask, VkDependencyFlags dependencyFlags, uint32_t memoryBarrierCount, const VkMemoryBarrier *pMemoryBarriers, uint32_t bufferMemoryBarrierCount, const VkBufferMemoryBarrier *pBufferMemoryBarriers, uint32_t imageMemoryBarrierCount, const VkImageMemoryBarrier *pImageMemoryBarriers)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
-	const VkBufferMemoryBarrier *buffer_barriers = pBufferMemoryBarriers;
-	temp_mem<VkBufferMemoryBarrier, 16> buffer_barrier_storage(bufferMemoryBarrierCount);
-	if (bufferMemoryBarrierCount != 0 && pBufferMemoryBarriers != nullptr)
-	{
-		for (uint32_t i = 0; i < bufferMemoryBarrierCount; ++i)
-		{
-			buffer_barrier_storage[i] = pBufferMemoryBarriers[i];
-			buffer_barrier_storage[i].buffer = pBufferMemoryBarriers[i].buffer;
-		}
-		buffer_barriers = buffer_barrier_storage.p;
-	}
-
-	const VkImageMemoryBarrier *image_barriers = pImageMemoryBarriers;
-	temp_mem<VkImageMemoryBarrier, 16> image_barrier_storage(imageMemoryBarrierCount);
-	if (imageMemoryBarrierCount != 0 && pImageMemoryBarriers != nullptr)
-	{
-		for (uint32_t i = 0; i < imageMemoryBarrierCount; ++i)
-		{
-			image_barrier_storage[i] = pImageMemoryBarriers[i];
-			image_barrier_storage[i].image = pImageMemoryBarriers[i].image;
-		}
-		image_barriers = image_barrier_storage.p;
-	}
 
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(CmdPipelineBarrier, device_impl);
-	trampoline(commandBuffer, srcStageMask, dstStageMask, dependencyFlags, memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount, buffer_barriers, imageMemoryBarrierCount, image_barriers);
+	trampoline(commandBuffer, srcStageMask, dstStageMask, dependencyFlags, memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount, pImageMemoryBarriers);
 
 #if RESHADE_ADDON >= 2
 	const uint32_t num_barriers = memoryBarrierCount + bufferMemoryBarrierCount + imageMemoryBarrierCount;
@@ -1816,7 +1796,7 @@ void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer commandBuffer, VkPipelineSt
 	}
 	for (uint32_t i = 0; i < bufferMemoryBarrierCount; ++i, ++k)
 	{
-		const VkBufferMemoryBarrier &barrier = buffer_barriers[i];
+		const VkBufferMemoryBarrier &barrier = pBufferMemoryBarriers[i];
 
 		resources[k] = { (uint64_t)barrier.buffer };
 		old_state[k] = reshade::vulkan::convert_access_to_usage(barrier.srcAccessMask);
@@ -1824,7 +1804,7 @@ void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer commandBuffer, VkPipelineSt
 	}
 	for (uint32_t i = 0; i < imageMemoryBarrierCount; ++i, ++k)
 	{
-		const VkImageMemoryBarrier &barrier = image_barriers[i];
+		const VkImageMemoryBarrier &barrier = pImageMemoryBarriers[i];
 
 		resources[k] = { (uint64_t)barrier.image };
 		old_state[k] = reshade::vulkan::convert_image_layout_to_usage(barrier.oldLayout);
@@ -2633,47 +2613,14 @@ void VKAPI_CALL vkCmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpa
 void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDependencyInfo *pDependencyInfo)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
-	const VkDependencyInfo *dependency_info = pDependencyInfo;
-	VkDependencyInfo dependency_info_copy = {};
-	temp_mem<VkBufferMemoryBarrier2, 16> buffer_barrier_storage((pDependencyInfo != nullptr) ? pDependencyInfo->bufferMemoryBarrierCount : 0);
-	if (pDependencyInfo != nullptr &&
-		pDependencyInfo->bufferMemoryBarrierCount != 0 &&
-		pDependencyInfo->pBufferMemoryBarriers != nullptr)
-	{
-		for (uint32_t i = 0; i < pDependencyInfo->bufferMemoryBarrierCount; ++i)
-		{
-			buffer_barrier_storage[i] = pDependencyInfo->pBufferMemoryBarriers[i];
-			buffer_barrier_storage[i].buffer = pDependencyInfo->pBufferMemoryBarriers[i].buffer;
-		}
-
-		dependency_info_copy = *pDependencyInfo;
-		dependency_info_copy.pBufferMemoryBarriers = buffer_barrier_storage.p;
-		dependency_info = &dependency_info_copy;
-	}
-
-	temp_mem<VkImageMemoryBarrier2, 16> image_barrier_storage((pDependencyInfo != nullptr) ? pDependencyInfo->imageMemoryBarrierCount : 0);
-	if (pDependencyInfo != nullptr &&
-		pDependencyInfo->imageMemoryBarrierCount != 0 &&
-		pDependencyInfo->pImageMemoryBarriers != nullptr)
-	{
-		for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; ++i)
-		{
-			image_barrier_storage[i] = pDependencyInfo->pImageMemoryBarriers[i];
-			image_barrier_storage[i].image = pDependencyInfo->pImageMemoryBarriers[i].image;
-		}
-
-		dependency_info_copy = *dependency_info;
-		dependency_info_copy.pImageMemoryBarriers = image_barrier_storage.p;
-		dependency_info = &dependency_info_copy;
-	}
 
 	RESHADE_VULKAN_GET_DEVICE_DISPATCH_PTR(CmdPipelineBarrier2, device_impl);
-	trampoline(commandBuffer, dependency_info);
+	trampoline(commandBuffer, pDependencyInfo);
 
 #if RESHADE_ADDON >= 2
-	assert(dependency_info != nullptr);
+	assert(pDependencyInfo != nullptr);
 
-	const uint32_t num_barriers = dependency_info->memoryBarrierCount + dependency_info->bufferMemoryBarrierCount + dependency_info->imageMemoryBarrierCount;
+	const uint32_t num_barriers = pDependencyInfo->memoryBarrierCount + pDependencyInfo->bufferMemoryBarrierCount + pDependencyInfo->imageMemoryBarrierCount;
 
 	if (num_barriers == 0 || !reshade::has_addon_event<reshade::addon_event::barrier>())
 		return;
@@ -2684,25 +2631,25 @@ void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDep
 	temp_mem<reshade::api::resource_usage, 32> old_state(num_barriers), new_state(num_barriers);
 
 	uint32_t k = 0;
-	for (uint32_t i = 0; i < dependency_info->memoryBarrierCount; ++i, ++k)
+	for (uint32_t i = 0; i < pDependencyInfo->memoryBarrierCount; ++i, ++k)
 	{
-		const VkMemoryBarrier2 &barrier = dependency_info->pMemoryBarriers[i];
+		const VkMemoryBarrier2 &barrier = pDependencyInfo->pMemoryBarriers[i];
 
 		resources[k] = { 0 };
 		old_state[k] = reshade::vulkan::convert_access_to_usage(barrier.srcAccessMask);
 		new_state[k] = reshade::vulkan::convert_access_to_usage(barrier.dstAccessMask);
 	}
-	for (uint32_t i = 0; i < dependency_info->bufferMemoryBarrierCount; ++i, ++k)
+	for (uint32_t i = 0; i < pDependencyInfo->bufferMemoryBarrierCount; ++i, ++k)
 	{
-		const VkBufferMemoryBarrier2 &barrier = dependency_info->pBufferMemoryBarriers[i];
+		const VkBufferMemoryBarrier2 &barrier = pDependencyInfo->pBufferMemoryBarriers[i];
 
 		resources[k] = { (uint64_t)barrier.buffer };
 		old_state[k] = reshade::vulkan::convert_access_to_usage(barrier.srcAccessMask);
 		new_state[k] = reshade::vulkan::convert_access_to_usage(barrier.dstAccessMask);
 	}
-	for (uint32_t i = 0; i < dependency_info->imageMemoryBarrierCount; ++i, ++k)
+	for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; ++i, ++k)
 	{
-		const VkImageMemoryBarrier2 &barrier = dependency_info->pImageMemoryBarriers[i];
+		const VkImageMemoryBarrier2 &barrier = pDependencyInfo->pImageMemoryBarriers[i];
 
 		resources[k] = { (uint64_t)barrier.image };
 		old_state[k] = reshade::vulkan::convert_image_layout_to_usage(barrier.oldLayout);
