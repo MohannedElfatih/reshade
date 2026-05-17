@@ -64,6 +64,8 @@ namespace reshade
 		return !addon_event_list[static_cast<uint32_t>(ev)].empty();
 	}
 
+	extern bool addon_vulkan_skip_render_pass_barriers;
+
 	/// <summary>
 	/// Invokes all registered callbacks for the specified <typeparamref name="ev"/>ent.
 	/// </summary>

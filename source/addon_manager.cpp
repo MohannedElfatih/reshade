@@ -136,6 +136,7 @@ static const char *addon_event_to_string(reshade::addon_event ev)
 bool reshade::addon_enabled = true;
 #endif
 bool reshade::addon_all_loaded = true;
+bool reshade::addon_vulkan_skip_render_pass_barriers = false;
 std::vector<void *> reshade::addon_event_list[static_cast<uint32_t>(reshade::addon_event::max)];
 std::vector<reshade::addon_info> reshade::addon_loaded_info;
 thread_local const reshade::addon_info *reshade::addon_current = nullptr;
@@ -150,6 +151,10 @@ void reshade::load_addons()
 	ini_file &config = global_config();
 
 	addon_all_loaded = true;
+	addon_vulkan_skip_render_pass_barriers = config.get("ADDON", "VulkanSkipRenderPassBarriers");
+
+	if (addon_vulkan_skip_render_pass_barriers)
+		log::message(log::level::warning, "Skipping Vulkan begin_render_pass add-on transition barriers because [ADDON] VulkanSkipRenderPassBarriers is enabled.");
 
 	std::vector<std::string> disabled_addons;
 	config.get("ADDON", "DisabledAddons", disabled_addons);
