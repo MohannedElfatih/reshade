@@ -1353,128 +1353,155 @@ static bool setup_shader_stage_inline(VkShaderStageFlagBits stage, const reshade
 	return true;
 }
 
-bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, uint32_t subobject_count, const api::pipeline_subobject *subobjects, api::pipeline *out_pipeline)
+struct graphics_pipeline_subobjects
 {
-	api::shader_desc vs_desc = {};
-	api::shader_desc hs_desc = {};
-	api::shader_desc ds_desc = {};
-	api::shader_desc gs_desc = {};
-	api::shader_desc ps_desc = {};
-	api::shader_desc cs_desc = {};
-	api::shader_desc as_desc = {};
-	api::shader_desc ms_desc = {};
-	api::pipeline_subobject input_layout_desc = {};
-	api::stream_output_desc stream_output_desc = {};
-	api::blend_desc blend_desc = {};
-	api::rasterizer_desc rasterizer_desc = {};
-	api::depth_stencil_desc depth_stencil_desc = {};
-	api::primitive_topology topology = api::primitive_topology::undefined;
-	api::format depth_stencil_format = api::format::unknown;
-	api::pipeline_subobject render_target_formats = {};
-	api::pipeline_subobject dynamic_states_subobject = {};
+	reshade::api::shader_desc vs_desc = {};
+	reshade::api::shader_desc hs_desc = {};
+	reshade::api::shader_desc ds_desc = {};
+	reshade::api::shader_desc gs_desc = {};
+	reshade::api::shader_desc ps_desc = {};
+	reshade::api::shader_desc as_desc = {};
+	reshade::api::shader_desc ms_desc = {};
+	reshade::api::pipeline_subobject input_layout_desc = {};
+	reshade::api::stream_output_desc stream_output_desc = {};
+	reshade::api::blend_desc blend_desc = {};
+	reshade::api::rasterizer_desc rasterizer_desc = {};
+	reshade::api::depth_stencil_desc depth_stencil_desc = {};
+	reshade::api::primitive_topology topology = reshade::api::primitive_topology::undefined;
+	reshade::api::format depth_stencil_format = reshade::api::format::unknown;
+	reshade::api::pipeline_subobject render_target_formats = {};
+	reshade::api::pipeline_subobject dynamic_states_subobject = {};
 	uint32_t sample_mask = UINT32_MAX;
 	uint32_t sample_count = 1;
 	uint32_t viewport_count = 1;
+	std::vector<reshade::api::pipeline> libraries;
+	reshade::api::pipeline_flags flags = reshade::api::pipeline_flags::none;
+};
+
+static bool parse_graphics_pipeline_subobject(const reshade::api::pipeline_subobject &subobject, graphics_pipeline_subobjects &out)
+{
+	switch (subobject.type)
+	{
+	case reshade::api::pipeline_subobject_type::vertex_shader:
+		assert(subobject.count == 1);
+		out.vs_desc = *static_cast<const reshade::api::shader_desc *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::hull_shader:
+		assert(subobject.count == 1);
+		out.hs_desc = *static_cast<const reshade::api::shader_desc *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::domain_shader:
+		assert(subobject.count == 1);
+		out.ds_desc = *static_cast<const reshade::api::shader_desc *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::geometry_shader:
+		assert(subobject.count == 1);
+		out.gs_desc = *static_cast<const reshade::api::shader_desc *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::pixel_shader:
+		assert(subobject.count == 1);
+		out.ps_desc = *static_cast<const reshade::api::shader_desc *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::input_layout:
+		out.input_layout_desc = subobject;
+		break;
+	case reshade::api::pipeline_subobject_type::stream_output_state:
+		assert(subobject.count == 1);
+		out.stream_output_desc = *static_cast<const reshade::api::stream_output_desc *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::blend_state:
+		assert(subobject.count == 1);
+		out.blend_desc = *static_cast<const reshade::api::blend_desc *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::rasterizer_state:
+		assert(subobject.count == 1);
+		out.rasterizer_desc = *static_cast<const reshade::api::rasterizer_desc *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::depth_stencil_state:
+		assert(subobject.count == 1);
+		out.depth_stencil_desc = *static_cast<const reshade::api::depth_stencil_desc *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::primitive_topology:
+		assert(subobject.count == 1);
+		out.topology = *static_cast<const reshade::api::primitive_topology *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::depth_stencil_format:
+		assert(subobject.count == 1);
+		out.depth_stencil_format = *static_cast<const reshade::api::format *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::render_target_formats:
+		assert(subobject.count <= 8);
+		out.render_target_formats = subobject;
+		break;
+	case reshade::api::pipeline_subobject_type::sample_mask:
+		assert(subobject.count == 1);
+		out.sample_mask = *static_cast<const uint32_t *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::sample_count:
+		assert(subobject.count == 1);
+		out.sample_count = *static_cast<const uint32_t *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::viewport_count:
+		assert(subobject.count == 1);
+		out.viewport_count = *static_cast<const uint32_t *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::dynamic_pipeline_states:
+		out.dynamic_states_subobject = subobject;
+		break;
+	case reshade::api::pipeline_subobject_type::max_vertex_count:
+		assert(subobject.count == 1);
+		break; // Ignored
+	case reshade::api::pipeline_subobject_type::amplification_shader:
+		assert(subobject.count == 1);
+		out.as_desc = *static_cast<const reshade::api::shader_desc *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::mesh_shader:
+		assert(subobject.count == 1);
+		out.ms_desc = *static_cast<const reshade::api::shader_desc *>(subobject.data);
+		break;
+	case reshade::api::pipeline_subobject_type::libraries:
+		for (uint32_t k = 0; k < subobject.count; ++k)
+			out.libraries.push_back(static_cast<const reshade::api::pipeline *>(subobject.data)[k]);
+		break;
+	case reshade::api::pipeline_subobject_type::flags:
+		assert(subobject.count == 1);
+		out.flags = *static_cast<const reshade::api::pipeline_flags *>(subobject.data);
+		break;
+	default:
+		return false;
+	}
+
+	return true;
+}
+
+bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, uint32_t subobject_count, const api::pipeline_subobject *subobjects, api::pipeline *out_pipeline)
+{
+	graphics_pipeline_subobjects graphics_subobjects;
+	api::shader_desc cs_desc = {};
 	std::vector<api::shader_desc> raygen_desc;
 	std::vector<api::shader_desc> any_hit_desc;
 	std::vector<api::shader_desc> closest_hit_desc;
 	std::vector<api::shader_desc> miss_desc;
 	std::vector<api::shader_desc> intersection_desc;
 	std::vector<api::shader_desc> callable_desc;
-	std::vector<api::pipeline> libraries;
 	std::vector<api::shader_group> shader_groups;
 	uint32_t max_payload_size = 0;
 	uint32_t max_attribute_size = 2 * sizeof(float); // Default triangle attributes
 	uint32_t max_recursion_depth = 1;
-	api::pipeline_flags flags = api::pipeline_flags::none;
 
 	for (uint32_t i = 0; i < subobject_count; ++i)
 	{
 		if (subobjects[i].count == 0)
 			continue;
 
+		if (parse_graphics_pipeline_subobject(subobjects[i], graphics_subobjects))
+			continue;
+
 		switch (subobjects[i].type)
 		{
-		case api::pipeline_subobject_type::vertex_shader:
-			assert(subobjects[i].count == 1);
-			vs_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::hull_shader:
-			assert(subobjects[i].count == 1);
-			hs_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::domain_shader:
-			assert(subobjects[i].count == 1);
-			ds_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::geometry_shader:
-			assert(subobjects[i].count == 1);
-			gs_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::pixel_shader:
-			assert(subobjects[i].count == 1);
-			ps_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
 		case api::pipeline_subobject_type::compute_shader:
 			assert(subobjects[i].count == 1);
 			cs_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::input_layout:
-			input_layout_desc = subobjects[i];
-			break;
-		case api::pipeline_subobject_type::stream_output_state:
-			assert(subobjects[i].count == 1);
-			stream_output_desc = *static_cast<const api::stream_output_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::blend_state:
-			assert(subobjects[i].count == 1);
-			blend_desc = *static_cast<const api::blend_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::rasterizer_state:
-			assert(subobjects[i].count == 1);
-			rasterizer_desc = *static_cast<const api::rasterizer_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::depth_stencil_state:
-			assert(subobjects[i].count == 1);
-			depth_stencil_desc = *static_cast<const api::depth_stencil_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::primitive_topology:
-			assert(subobjects[i].count == 1);
-			topology = *static_cast<const api::primitive_topology *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::depth_stencil_format:
-			assert(subobjects[i].count == 1);
-			depth_stencil_format = *static_cast<const api::format *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::render_target_formats:
-			assert(subobjects[i].count <= 8);
-			render_target_formats = subobjects[i];
-			break;
-		case api::pipeline_subobject_type::sample_mask:
-			assert(subobjects[i].count == 1);
-			sample_mask = *static_cast<const uint32_t *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::sample_count:
-			assert(subobjects[i].count == 1);
-			sample_count = *static_cast<const uint32_t *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::viewport_count:
-			assert(subobjects[i].count == 1);
-			viewport_count = *static_cast<const uint32_t *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::dynamic_pipeline_states:
-			dynamic_states_subobject = subobjects[i];
-			break;
-		case api::pipeline_subobject_type::max_vertex_count:
-			assert(subobjects[i].count == 1);
-			break; // Ignored
-		case api::pipeline_subobject_type::amplification_shader:
-			assert(subobjects[i].count == 1);
-			as_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::mesh_shader:
-			assert(subobjects[i].count == 1);
-			ms_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
 			break;
 		case api::pipeline_subobject_type::raygen_shader:
 			for (uint32_t k = 0; k < subobjects[i].count; ++k)
@@ -1500,10 +1527,6 @@ bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, 
 			for (uint32_t k = 0; k < subobjects[i].count; ++k)
 				callable_desc.push_back(static_cast<const api::shader_desc *>(subobjects[i].data)[k]);
 			break;
-		case api::pipeline_subobject_type::libraries:
-			for (uint32_t k = 0; k < subobjects[i].count; ++k)
-				libraries.push_back(static_cast<const api::pipeline *>(subobjects[i].data)[k]);
-			break;
 		case api::pipeline_subobject_type::shader_groups:
 			for (uint32_t k = 0; k < subobjects[i].count; ++k)
 				shader_groups.push_back(static_cast<const api::shader_group *>(subobjects[i].data)[k]);
@@ -1520,10 +1543,6 @@ bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, 
 			assert(subobjects[i].count == 1);
 			max_recursion_depth = *static_cast<const uint32_t *>(subobjects[i].data);
 			break;
-		case api::pipeline_subobject_type::flags:
-			assert(subobjects[i].count == 1);
-			flags = *static_cast<const api::pipeline_flags *>(subobjects[i].data);
-			break;
 		default:
 			assert(false);
 			goto exit_failure;
@@ -1534,7 +1553,7 @@ bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, 
 	{
 #if VK_KHR_ray_tracing_pipeline && VK_KHR_pipeline_library
 		VkRayTracingPipelineCreateInfoKHR create_info { VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR };
-		create_info.flags = convert_pipeline_flags(flags);
+		create_info.flags = convert_pipeline_flags(graphics_subobjects.flags);
 		create_info.layout = (VkPipelineLayout)layout.handle;
 		create_info.maxPipelineRayRecursionDepth = max_recursion_depth;
 
@@ -1690,11 +1709,11 @@ bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, 
 
 		VkPipelineLibraryCreateInfoKHR library_info;
 		VkRayTracingPipelineInterfaceCreateInfoKHR interface_info;
-		if (!libraries.empty())
+		if (!graphics_subobjects.libraries.empty())
 		{
 			library_info = { VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR };
-			library_info.libraryCount = static_cast<uint32_t>(libraries.size());
-			library_info.pLibraries = reinterpret_cast<const VkPipeline *>(libraries.data());
+			library_info.libraryCount = static_cast<uint32_t>(graphics_subobjects.libraries.size());
+			library_info.pLibraries = reinterpret_cast<const VkPipeline *>(graphics_subobjects.libraries.data());
 
 			interface_info = { VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_INTERFACE_CREATE_INFO_KHR };
 			interface_info.maxPipelineRayPayloadSize = max_payload_size;
@@ -1787,27 +1806,28 @@ bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, 
 {
 	VkRenderPass render_pass = VK_NULL_HANDLE;
 
-	api::shader_desc vs_desc = {};
-	api::shader_desc hs_desc = {};
-	api::shader_desc ds_desc = {};
-	api::shader_desc gs_desc = {};
-	api::shader_desc ps_desc = {};
-	api::shader_desc as_desc = {};
-	api::shader_desc ms_desc = {};
-	api::pipeline_subobject input_layout_desc = {};
-	api::stream_output_desc stream_output_desc = {};
-	api::blend_desc blend_desc = {};
-	api::rasterizer_desc rasterizer_desc = {};
-	api::depth_stencil_desc depth_stencil_desc = {};
-	api::primitive_topology topology = api::primitive_topology::undefined;
-	api::format depth_stencil_format = api::format::unknown;
-	api::pipeline_subobject render_target_formats = {};
-	api::pipeline_subobject dynamic_states_subobject = {};
-	uint32_t sample_mask = UINT32_MAX;
-	uint32_t sample_count = 1;
-	uint32_t viewport_count = 1;
-	std::vector<api::pipeline> libraries;
-	api::pipeline_flags flags = api::pipeline_flags::none;
+	graphics_pipeline_subobjects graphics_subobjects;
+	auto &vs_desc = graphics_subobjects.vs_desc;
+	auto &hs_desc = graphics_subobjects.hs_desc;
+	auto &ds_desc = graphics_subobjects.ds_desc;
+	auto &gs_desc = graphics_subobjects.gs_desc;
+	auto &ps_desc = graphics_subobjects.ps_desc;
+	auto &as_desc = graphics_subobjects.as_desc;
+	auto &ms_desc = graphics_subobjects.ms_desc;
+	auto &input_layout_desc = graphics_subobjects.input_layout_desc;
+	auto &stream_output_desc = graphics_subobjects.stream_output_desc;
+	auto &blend_desc = graphics_subobjects.blend_desc;
+	auto &rasterizer_desc = graphics_subobjects.rasterizer_desc;
+	auto &depth_stencil_desc = graphics_subobjects.depth_stencil_desc;
+	auto &topology = graphics_subobjects.topology;
+	auto &depth_stencil_format = graphics_subobjects.depth_stencil_format;
+	auto &render_target_formats = graphics_subobjects.render_target_formats;
+	auto &dynamic_states_subobject = graphics_subobjects.dynamic_states_subobject;
+	auto &sample_mask = graphics_subobjects.sample_mask;
+	auto &sample_count = graphics_subobjects.sample_count;
+	auto &viewport_count = graphics_subobjects.viewport_count;
+	auto &libraries = graphics_subobjects.libraries;
+	auto &flags = graphics_subobjects.flags;
 	std::vector<pnext_link_restore> pnext_restore_links;
 
 	for (uint32_t i = 0; i < subobject_count; ++i)
@@ -1815,91 +1835,8 @@ bool reshade::vulkan::device_impl::create_pipeline(api::pipeline_layout layout, 
 		if (subobjects[i].count == 0)
 			continue;
 
-		switch (subobjects[i].type)
+		if (!parse_graphics_pipeline_subobject(subobjects[i], graphics_subobjects))
 		{
-		case api::pipeline_subobject_type::vertex_shader:
-			assert(subobjects[i].count == 1);
-			vs_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::hull_shader:
-			assert(subobjects[i].count == 1);
-			hs_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::domain_shader:
-			assert(subobjects[i].count == 1);
-			ds_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::geometry_shader:
-			assert(subobjects[i].count == 1);
-			gs_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::pixel_shader:
-			assert(subobjects[i].count == 1);
-			ps_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::input_layout:
-			input_layout_desc = subobjects[i];
-			break;
-		case api::pipeline_subobject_type::stream_output_state:
-			assert(subobjects[i].count == 1);
-			stream_output_desc = *static_cast<const api::stream_output_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::blend_state:
-			assert(subobjects[i].count == 1);
-			blend_desc = *static_cast<const api::blend_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::rasterizer_state:
-			assert(subobjects[i].count == 1);
-			rasterizer_desc = *static_cast<const api::rasterizer_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::depth_stencil_state:
-			assert(subobjects[i].count == 1);
-			depth_stencil_desc = *static_cast<const api::depth_stencil_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::primitive_topology:
-			assert(subobjects[i].count == 1);
-			topology = *static_cast<const api::primitive_topology *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::depth_stencil_format:
-			assert(subobjects[i].count == 1);
-			depth_stencil_format = *static_cast<const api::format *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::render_target_formats:
-			assert(subobjects[i].count <= 8);
-			render_target_formats = subobjects[i];
-			break;
-		case api::pipeline_subobject_type::sample_mask:
-			assert(subobjects[i].count == 1);
-			sample_mask = *static_cast<const uint32_t *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::sample_count:
-			assert(subobjects[i].count == 1);
-			sample_count = *static_cast<const uint32_t *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::viewport_count:
-			assert(subobjects[i].count == 1);
-			viewport_count = *static_cast<const uint32_t *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::dynamic_pipeline_states:
-			dynamic_states_subobject = subobjects[i];
-			break;
-		case api::pipeline_subobject_type::amplification_shader:
-			assert(subobjects[i].count == 1);
-			as_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::mesh_shader:
-			assert(subobjects[i].count == 1);
-			ms_desc = *static_cast<const api::shader_desc *>(subobjects[i].data);
-			break;
-		case api::pipeline_subobject_type::libraries:
-			for (uint32_t k = 0; k < subobjects[i].count; ++k)
-				libraries.push_back(static_cast<const api::pipeline *>(subobjects[i].data)[k]);
-			break;
-		case api::pipeline_subobject_type::flags:
-			assert(subobjects[i].count == 1);
-			flags = *static_cast<const api::pipeline_flags *>(subobjects[i].data);
-			break;
-		default:
 			assert(false);
 			goto exit_failure;
 		}
