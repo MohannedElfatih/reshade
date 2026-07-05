@@ -132,6 +132,9 @@ set(RESHADE_SOURCE_DIRECTX
   source/d3d12/d3d12_command_queue.hpp
   source/d3d12/d3d12_command_queue_downlevel.cpp
   source/d3d12/d3d12_command_queue_downlevel.hpp
+  source/d3d12/d3d12_async_pipeline.cpp
+  source/d3d12/d3d12_async_pipeline.hpp
+  source/d3d12/d3d12_async_pipeline_shaders.hpp
   source/d3d12/d3d12_descriptor_heap.cpp
   source/d3d12/d3d12_device.cpp
   source/d3d12/d3d12_device_downlevel.cpp
@@ -341,7 +344,7 @@ else()
   )
 endif()
 
-target_link_libraries(ReShade PRIVATE ReShadeFX D3D12On7 fpng glad ImGui jxl MinHook OpenVR OpenXR stb utfcpp VMA Windows)
+target_link_libraries(ReShade PRIVATE ReShadeFX D3D12On7 fpng glad ImGui jxl MinHook OpenVR OpenXR stb utfcpp VMA Windows d3dcompiler.lib)
 
 # ReShade FX
 

@@ -8,6 +8,7 @@
 #include "d3d12_command_list.hpp"
 #include "d3d12_command_queue.hpp"
 #include "d3d12_extensions.hpp"
+#include "d3d12_async_pipeline.hpp"
 #include "d3d12_descriptor_heap.hpp"
 #include "d3d12_pipeline_library.hpp"
 #include "d3d12_resource.hpp"
@@ -33,6 +34,8 @@ D3D12Device::D3D12Device(ID3D12Device *original) :
 	D3D12Device *const device_proxy = this;
 	_orig->SetPrivateData(__uuidof(D3D12Device), sizeof(device_proxy), &device_proxy);
 
+	_async_pipeline_manager = create_d3d12_async_pipeline_manager(this, _orig);
+
 #if RESHADE_ADDON
 	reshade::load_addons();
 
@@ -41,6 +44,9 @@ D3D12Device::D3D12Device(ID3D12Device *original) :
 }
 D3D12Device::~D3D12Device()
 {
+	destroy_d3d12_async_pipeline_manager(_async_pipeline_manager);
+	_async_pipeline_manager = nullptr;
+
 #if RESHADE_ADDON
 	reshade::invoke_addon_event<reshade::addon_event::destroy_device>(this);
 
@@ -288,14 +294,9 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreateGraphicsPipelineState(const D3D12_G
 	if (pDesc == nullptr)
 		return E_INVALIDARG;
 
-	HRESULT hr = S_OK;
-#if RESHADE_ADDON >= 2
-	if (ppPipelineState == nullptr || ( // This can happen when application only wants to validate input parameters
-		riid != __uuidof(ID3D12PipelineState) &&
-		riid != __uuidof(ID3D12PipelineState1)) ||
-		!invoke_create_and_init_pipeline_event(*pDesc, *reinterpret_cast<ID3D12PipelineState **>(ppPipelineState), hr, true))
-#endif
-		hr = _orig->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState);
+	HRESULT hr = ppPipelineState == nullptr ?
+		_orig->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState) :
+		create_async_graphics_pipeline_state(_async_pipeline_manager, pDesc, riid, ppPipelineState);
 
 #if RESHADE_VERBOSE_LOG
 	if (FAILED(hr) && ppPipelineState != nullptr)
@@ -311,14 +312,9 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreateComputePipelineState(const D3D12_CO
 	if (pDesc == nullptr)
 		return E_INVALIDARG;
 
-	HRESULT hr = S_OK;
-#if RESHADE_ADDON >= 2
-	if (ppPipelineState == nullptr || ( // This can happen when application only wants to validate input parameters
-		riid != __uuidof(ID3D12PipelineState) &&
-		riid != __uuidof(ID3D12PipelineState1)) ||
-		!invoke_create_and_init_pipeline_event(*pDesc, *reinterpret_cast<ID3D12PipelineState **>(ppPipelineState), hr, true))
-#endif
-		hr = _orig->CreateComputePipelineState(pDesc, riid, ppPipelineState);
+	HRESULT hr = ppPipelineState == nullptr ?
+		_orig->CreateComputePipelineState(pDesc, riid, ppPipelineState) :
+		create_async_compute_pipeline_state(_async_pipeline_manager, pDesc, riid, ppPipelineState);
 
 #if RESHADE_VERBOSE_LOG
 	if (FAILED(hr) && ppPipelineState != nullptr)
@@ -331,7 +327,9 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreateComputePipelineState(const D3D12_CO
 }
 HRESULT STDMETHODCALLTYPE D3D12Device::CreateCommandList(UINT nodeMask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *pCommandAllocator, ID3D12PipelineState *pInitialState, REFIID riid, void **ppCommandList)
 {
-	const HRESULT hr = _orig->CreateCommandList(nodeMask, type, pCommandAllocator, pInitialState, riid, ppCommandList);
+	bool initial_state_is_fallback = false;
+	ID3D12PipelineState *const initial_state = resolve_async_pipeline_state(pInitialState, &initial_state_is_fallback);
+	const HRESULT hr = _orig->CreateCommandList(nodeMask, type, pCommandAllocator, initial_state, riid, ppCommandList);
 	if (SUCCEEDED(hr))
 	{
 		assert(ppCommandList != nullptr);
@@ -344,6 +342,8 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreateCommandList(UINT nodeMask, D3D12_CO
 			// Upgrade to the actual interface version requested here (and only hook graphics command lists)
 			if (command_list_proxy->check_and_upgrade_interface(riid))
 			{
+				command_list_proxy->set_async_pipeline_state_cache(pInitialState);
+				command_list_proxy->set_async_pipeline_state_is_fallback(initial_state_is_fallback);
 				*ppCommandList = command_list_proxy;
 
 #if RESHADE_ADDON
@@ -352,8 +352,8 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreateCommandList(UINT nodeMask, D3D12_CO
 #endif
 
 #if RESHADE_ADDON >= 2
-				if (pInitialState != nullptr)
-					reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(command_list_proxy, reshade::api::pipeline_stage::all, to_handle(pInitialState));
+				if (initial_state != nullptr)
+					reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(command_list_proxy, reshade::api::pipeline_stage::all, initial_state_is_fallback ? reshade::api::pipeline {} : to_handle(initial_state));
 #endif
 			}
 			else // Do not hook object if we do not support the requested interface
@@ -1017,35 +1017,43 @@ HRESULT STDMETHODCALLTYPE D3D12Device::OpenSharedHandleByName(LPCWSTR Name, DWOR
 }
 HRESULT STDMETHODCALLTYPE D3D12Device::MakeResident(UINT NumObjects, ID3D12Pageable *const *ppObjects)
 {
-#if RESHADE_ADDON >= 2
 	temp_mem<ID3D12Pageable *> objects(NumObjects);
 	for (UINT i = 0; i < NumObjects; ++i)
 	{
+#if RESHADE_ADDON >= 2
 		if (com_ptr<D3D12DescriptorHeap> descriptor_heap_proxy;
 			SUCCEEDED(ppObjects[i]->QueryInterface(&descriptor_heap_proxy)))
 			objects[i] = descriptor_heap_proxy->_orig;
 		else
-			objects[i] = ppObjects[i];
+
+#endif
+		{
+			note_async_pageable_make_resident(ppObjects[i]);
+			objects[i] = resolve_async_pageable(ppObjects[i]);
+		}
 	}
 	ppObjects = objects.p;
-#endif
 
 	return _orig->MakeResident(NumObjects, ppObjects);
 }
 HRESULT STDMETHODCALLTYPE D3D12Device::Evict(UINT NumObjects, ID3D12Pageable *const *ppObjects)
 {
-#if RESHADE_ADDON >= 2
 	temp_mem<ID3D12Pageable *> objects(NumObjects);
 	for (UINT i = 0; i < NumObjects; ++i)
 	{
+#if RESHADE_ADDON >= 2
 		if (com_ptr<D3D12DescriptorHeap> descriptor_heap_proxy;
 			SUCCEEDED(ppObjects[i]->QueryInterface(&descriptor_heap_proxy)))
 			objects[i] = descriptor_heap_proxy->_orig;
 		else
-			objects[i] = ppObjects[i];
+
+#endif
+		{
+			note_async_pageable_evict(ppObjects[i]);
+			objects[i] = resolve_async_pageable(ppObjects[i]);
+		}
 	}
 	ppObjects = objects.p;
-#endif
 
 	return _orig->Evict(NumObjects, ppObjects);
 }
@@ -1136,7 +1144,8 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreatePipelineLibrary(const void *pLibrar
 	if (SUCCEEDED(hr) && ppPipelineLibrary != nullptr)
 	{
 #if RESHADE_ADDON >= 2
-		if (reshade::has_addon_event<reshade::addon_event::init_pipeline>() ||
+		if (_async_pipeline_manager != nullptr ||
+			reshade::has_addon_event<reshade::addon_event::init_pipeline>() ||
 			reshade::has_addon_event<reshade::addon_event::destroy_pipeline>())
 		{
 			const auto pipeline_library_proxy = new D3D12PipelineLibrary(this, static_cast<ID3D12PipelineLibrary *>(*ppPipelineLibrary));
@@ -1168,18 +1177,22 @@ HRESULT STDMETHODCALLTYPE D3D12Device::SetResidencyPriority(UINT NumObjects, ID3
 {
 	assert(_interface_version >= 1);
 
-#if RESHADE_ADDON >= 2
 	temp_mem<ID3D12Pageable *> objects(NumObjects);
 	for (UINT i = 0; i < NumObjects; ++i)
 	{
+#if RESHADE_ADDON >= 2
 		if (com_ptr<D3D12DescriptorHeap> descriptor_heap_proxy;
 			SUCCEEDED(ppObjects[i]->QueryInterface(&descriptor_heap_proxy)))
 			objects[i] = descriptor_heap_proxy->_orig;
 		else
-			objects[i] = ppObjects[i];
+
+#endif
+		{
+			note_async_pageable_residency_priority(ppObjects[i], pPriorities[i]);
+			objects[i] = resolve_async_pageable(ppObjects[i]);
+		}
 	}
 	ppObjects = objects.p;
-#endif
 
 	return static_cast<ID3D12Device1 *>(_orig)->SetResidencyPriority(NumObjects, ppObjects, pPriorities);
 }
@@ -1191,14 +1204,17 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreatePipelineState(const D3D12_PIPELINE_
 	if (pDesc == nullptr)
 		return E_INVALIDARG;
 
+	note_async_pipeline_state_stream_create(riid);
+
 	HRESULT hr = S_OK;
-#if RESHADE_ADDON >= 2
-	if (ppPipelineState == nullptr || ( // This can happen when application only wants to validate input parameters
-		riid != __uuidof(ID3D12PipelineState) &&
-		riid != __uuidof(ID3D12PipelineState1)) ||
-		!invoke_create_and_init_pipeline_event(*pDesc, *reinterpret_cast<ID3D12PipelineState **>(ppPipelineState), hr, true))
-#endif
+	if (ppPipelineState == nullptr || (riid != __uuidof(ID3D12PipelineState) && riid != __uuidof(ID3D12PipelineState1)))
+	{
 		hr = static_cast<ID3D12Device2 *>(_orig)->CreatePipelineState(pDesc, riid, ppPipelineState);
+	}
+	else
+	{
+		hr = create_async_pipeline_state_stream(_async_pipeline_manager, pDesc, riid, ppPipelineState);
+	}
 
 #if RESHADE_VERBOSE_LOG
 	if (FAILED(hr) && ppPipelineState != nullptr)
@@ -1226,18 +1242,22 @@ HRESULT STDMETHODCALLTYPE D3D12Device::EnqueueMakeResident(D3D12_RESIDENCY_FLAGS
 {
 	assert(_interface_version >= 3);
 
-#if RESHADE_ADDON >= 2
 	temp_mem<ID3D12Pageable *> objects(NumObjects);
 	for (UINT i = 0; i < NumObjects; ++i)
 	{
+#if RESHADE_ADDON >= 2
 		if (com_ptr<D3D12DescriptorHeap> descriptor_heap_proxy;
 			SUCCEEDED(ppObjects[i]->QueryInterface(&descriptor_heap_proxy)))
 			objects[i] = descriptor_heap_proxy->_orig;
 		else
-			objects[i] = ppObjects[i];
+
+#endif
+		{
+			note_async_pageable_make_resident(ppObjects[i]);
+			objects[i] = resolve_async_pageable(ppObjects[i]);
+		}
 	}
 	ppObjects = objects.p;
-#endif
 
 	return static_cast<ID3D12Device3 *>(_orig)->EnqueueMakeResident(Flags, NumObjects, ppObjects, pFenceToSignal, FenceValueToSignal);
 }

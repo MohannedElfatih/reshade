@@ -7,6 +7,7 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_pipeline_library.hpp"
+#include "d3d12_async_pipeline.hpp"
 #include "dll_log.hpp" // Include late to get 'hr_to_string' helper function
 #include "com_utils.hpp"
 
@@ -127,6 +128,15 @@ HRESULT STDMETHODCALLTYPE D3D12PipelineLibrary::GetDevice(REFIID riid, void **pp
 
 HRESULT STDMETHODCALLTYPE D3D12PipelineLibrary::StorePipeline(LPCWSTR pName, ID3D12PipelineState *pPipeline)
 {
+	if (D3D12AsyncPipelineProxy *const proxy = get_async_pipeline_state_proxy(pPipeline))
+	{
+		const HRESULT hr = store_async_pipeline_state_proxy_or_defer(proxy, this, pName);
+		release_async_pipeline_state_proxy(proxy);
+		return hr;
+	}
+
+	if (pPipeline == nullptr)
+		return E_FAIL;
 	return _orig->StorePipeline(pName, pPipeline);
 }
 HRESULT STDMETHODCALLTYPE D3D12PipelineLibrary::LoadGraphicsPipeline(LPCWSTR pName, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState)
