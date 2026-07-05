@@ -8,6 +8,7 @@
 #include "d3d12_impl_command_list.hpp"
 
 class D3D12Device;
+class D3D12AsyncPipelineProxy;
 
 class DECLSPEC_UUID("479B29E3-9A2C-11D0-B696-00A0C903487A") D3D12GraphicsCommandList final : public ID3D12GraphicsCommandList10, public reshade::d3d12::command_list_impl
 {
@@ -133,6 +134,10 @@ public:
 	#pragma endregion
 
 	bool check_and_upgrade_interface(REFIID riid);
+	void set_async_pipeline_state_is_fallback(bool value) { _async_pipeline_state_is_fallback = value; }
+	void set_async_pipeline_state_cache(ID3D12PipelineState *pipeline_state);
+	void reset_async_pipeline_state_cache();
+	bool try_promote_async_pipeline_state_from_fallback();
 
 	using command_list_impl::_orig;
 	LONG _ref = 1;
@@ -140,4 +145,7 @@ public:
 
 private:
 	D3D12Device *const _device;
+	bool _async_pipeline_state_is_fallback = false;
+	ID3D12PipelineState *_async_pipeline_state_cache_input = nullptr;
+	D3D12AsyncPipelineProxy *_async_pipeline_state_cache_proxy = nullptr;
 };

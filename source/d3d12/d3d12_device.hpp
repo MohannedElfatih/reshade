@@ -8,6 +8,7 @@
 #include "d3d12_impl_device.hpp"
 
 class D3D12DeviceDownlevel;
+class D3D12AsyncPipelineManager;
 
 class DECLSPEC_UUID("2523AFF4-978B-4939-BA16-8EE876A4CB2A") D3D12Device final : public ID3D12Device14, public reshade::d3d12::device_impl
 {
@@ -154,4 +155,5 @@ public:
 
 private:
 	D3D12DeviceDownlevel *_downlevel = nullptr;
+	D3D12AsyncPipelineManager *_async_pipeline_manager = nullptr;
 };
