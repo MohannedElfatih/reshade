@@ -65,15 +65,14 @@ static constexpr bool async_graphics_fallback_enabled = true;
 static constexpr bool async_compute_fallback_enabled = true;
 static constexpr uint64_t min_fallback_binds_before_real = 0;
 static constexpr uint64_t min_fallback_binds_before_compile = 0;
-static constexpr size_t async_pipeline_compile_worker_count = 6;
+static constexpr unsigned int async_pipeline_compile_worker_thread_percentage = 75;
 
 static size_t get_async_pipeline_compile_worker_count()
 {
 	const unsigned int hardware_threads = std::thread::hardware_concurrency();
 	const size_t hardware_thread_count = hardware_threads != 0 ? static_cast<size_t>(hardware_threads) : 1;
-	const size_t hardware_thread_half_count = std::max<size_t>(1, hardware_thread_count / 2);
-	const size_t max_worker_count = async_pipeline_compile_worker_count != 0 ? async_pipeline_compile_worker_count : 1;
-	return std::min(max_worker_count, hardware_thread_half_count);
+	const unsigned int percentage = async_pipeline_compile_worker_thread_percentage != 0 ? async_pipeline_compile_worker_thread_percentage : 100;
+	return std::max<size_t>(1, (hardware_thread_count * percentage) / 100);
 }
 
 class D3D12AsyncPipelineProxy;
