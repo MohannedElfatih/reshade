@@ -284,7 +284,8 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DrawInstanced(UINT VertexCountP
 		try_promote_async_pipeline_state_from_fallback();
 		if (_async_pipeline_state_is_fallback)
 		{
-			_orig->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+			// _orig->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+			note_async_pipeline_fallback_draw_skip();
 			return;
 		}
 	}
@@ -302,7 +303,8 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DrawIndexedInstanced(UINT Index
 		try_promote_async_pipeline_state_from_fallback();
 		if (_async_pipeline_state_is_fallback)
 		{
-			_orig->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+			// _orig->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+			note_async_pipeline_fallback_draw_skip();
 			return;
 		}
 	}
@@ -320,7 +322,8 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::Dispatch(UINT ThreadGroupCountX
 		try_promote_async_pipeline_state_from_fallback();
 		if (_async_pipeline_state_is_fallback)
 		{
-			_orig->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+			// _orig->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+			note_async_pipeline_fallback_draw_skip();
 			return;
 		}
 	}
@@ -1029,7 +1032,8 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::ExecuteIndirect(ID3D12CommandSi
 		try_promote_async_pipeline_state_from_fallback();
 		if (_async_pipeline_state_is_fallback)
 		{
-			_orig->ExecuteIndirect(pCommandSignature, MaxCommandCount, pArgumentBuffer, ArgumentBufferOffset, pCountBuffer, CountBufferOffset);
+			// _orig->ExecuteIndirect(pCommandSignature, MaxCommandCount, pArgumentBuffer, ArgumentBufferOffset, pCountBuffer, CountBufferOffset);
+			note_async_pipeline_fallback_draw_skip();
 			return;
 		}
 	}
@@ -1303,6 +1307,17 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::RSSetShadingRateImage(ID3D12Res
 void STDMETHODCALLTYPE D3D12GraphicsCommandList::DispatchMesh(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ)
 {
 	assert(_interface_version >= 6);
+
+	if (_async_pipeline_state_is_fallback)
+	{
+		try_promote_async_pipeline_state_from_fallback();
+		if (_async_pipeline_state_is_fallback)
+		{
+			// _orig->DispatchMesh(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+			note_async_pipeline_fallback_draw_skip();
+			return;
+		}
+	}
 
 #if RESHADE_ADDON
 	if (reshade::invoke_addon_event<reshade::addon_event::dispatch_mesh>(this, ThreadGroupCountX, ThreadGroupCountX, ThreadGroupCountZ))

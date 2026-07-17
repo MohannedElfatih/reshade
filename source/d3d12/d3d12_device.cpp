@@ -288,12 +288,17 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreateGraphicsPipelineState(const D3D12_G
 
 	HRESULT hr = ppPipelineState == nullptr ?
 		_orig->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState) :
-		create_async_graphics_pipeline_state(_async_pipeline_manager, pDesc, riid, ppPipelineState);
+		_async_pipeline_manager != nullptr ?
+			create_async_graphics_pipeline_state(_async_pipeline_manager, pDesc, riid, ppPipelineState) :
+			_orig->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState);
+
+	if (_async_pipeline_manager == nullptr && ppPipelineState != nullptr && FAILED(hr))
+		reshade::log::message(reshade::log::level::warning, "Sync D3D12 graphics PSO creation failed with error code %s (riid = %s).", reshade::log::hr_to_string(hr).c_str(), reshade::log::iid_to_string(riid).c_str());
 
 #if RESHADE_VERBOSE_LOG
 	if (FAILED(hr) && ppPipelineState != nullptr)
 	{
-		reshade::log::message(reshade::log::level::warning, "ID3D12Device::CreateGraphicsPipelineState failed with error code %ld.");
+		reshade::log::message(reshade::log::level::warning, "ID3D12Device::CreateGraphicsPipelineState failed with error code %s.", reshade::log::hr_to_string(hr).c_str());
 	}
 #endif
 
@@ -306,7 +311,12 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreateComputePipelineState(const D3D12_CO
 
 	HRESULT hr = ppPipelineState == nullptr ?
 		_orig->CreateComputePipelineState(pDesc, riid, ppPipelineState) :
-		create_async_compute_pipeline_state(_async_pipeline_manager, pDesc, riid, ppPipelineState);
+		_async_pipeline_manager != nullptr ?
+			create_async_compute_pipeline_state(_async_pipeline_manager, pDesc, riid, ppPipelineState) :
+			_orig->CreateComputePipelineState(pDesc, riid, ppPipelineState);
+
+	if (_async_pipeline_manager == nullptr && ppPipelineState != nullptr && FAILED(hr))
+		reshade::log::message(reshade::log::level::warning, "Sync D3D12 compute PSO creation failed with error code %s (riid = %s).", reshade::log::hr_to_string(hr).c_str(), reshade::log::iid_to_string(riid).c_str());
 
 #if RESHADE_VERBOSE_LOG
 	if (FAILED(hr) && ppPipelineState != nullptr)
@@ -1196,10 +1206,12 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreatePipelineState(const D3D12_PIPELINE_
 	if (pDesc == nullptr)
 		return E_INVALIDARG;
 
-	note_async_pipeline_state_stream_create(riid);
+	if (_async_pipeline_manager != nullptr)
+		note_async_pipeline_state_stream_create(riid);
 
 	HRESULT hr = S_OK;
-	if (ppPipelineState == nullptr || (riid != __uuidof(ID3D12PipelineState) && riid != __uuidof(ID3D12PipelineState1)))
+	const bool sync_creation = _async_pipeline_manager == nullptr || ppPipelineState == nullptr || (riid != __uuidof(ID3D12PipelineState) && riid != __uuidof(ID3D12PipelineState1));
+	if (sync_creation)
 	{
 		hr = static_cast<ID3D12Device2 *>(_orig)->CreatePipelineState(pDesc, riid, ppPipelineState);
 	}
@@ -1207,6 +1219,9 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreatePipelineState(const D3D12_PIPELINE_
 	{
 		hr = create_async_pipeline_state_stream(_async_pipeline_manager, pDesc, riid, ppPipelineState);
 	}
+
+	if (_async_pipeline_manager == nullptr && ppPipelineState != nullptr && FAILED(hr))
+		reshade::log::message(reshade::log::level::warning, "Sync D3D12 stream PSO creation failed with error code %s (riid = %s, size = %zu).", reshade::log::hr_to_string(hr).c_str(), reshade::log::iid_to_string(riid).c_str(), pDesc->SizeInBytes);
 
 #if RESHADE_VERBOSE_LOG
 	if (FAILED(hr) && ppPipelineState != nullptr)

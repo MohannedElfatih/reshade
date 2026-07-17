@@ -67,6 +67,8 @@ static constexpr uint64_t min_fallback_binds_before_real = 0;
 static constexpr uint64_t min_fallback_binds_before_compile = 0;
 static constexpr unsigned int async_pipeline_compile_worker_thread_percentage = 75;
 
+static constexpr bool async_pipeline_enabled = async_graphics_fallback_enabled || async_compute_fallback_enabled;
+
 static size_t get_async_pipeline_compile_worker_count()
 {
 	const unsigned int hardware_threads = std::thread::hardware_concurrency();
@@ -628,9 +630,13 @@ struct ComputeFallbackKeyHash
 struct CopiedGraphicsPipelineDesc
 {
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+	com_ptr<ID3D12RootSignature> root_signature;
 	std::vector<uint8_t> vs, ps, ds, hs, gs, cached_pso;
 	std::vector<D3D12_INPUT_ELEMENT_DESC> input_elements;
 	std::vector<std::string> semantic_names;
+	std::vector<D3D12_SO_DECLARATION_ENTRY> stream_output_entries;
+	std::vector<std::string> stream_output_semantic_names;
+	std::vector<UINT> stream_output_strides;
 
 	static void copy_bytecode(const D3D12_SHADER_BYTECODE &src, std::vector<uint8_t> &storage, D3D12_SHADER_BYTECODE &dst)
 	{
@@ -647,6 +653,8 @@ struct CopiedGraphicsPipelineDesc
 	explicit CopiedGraphicsPipelineDesc(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &source)
 	{
 		desc = source;
+		root_signature = source.pRootSignature;
+		desc.pRootSignature = root_signature.get();
 		copy_bytecode(source.VS, vs, desc.VS);
 		copy_bytecode(source.PS, ps, desc.PS);
 		copy_bytecode(source.DS, ds, desc.DS);
@@ -671,17 +679,38 @@ struct CopiedGraphicsPipelineDesc
 			element.SemanticName = semantic_names.back().c_str();
 		}
 		desc.InputLayout = { input_elements.data(), static_cast<UINT>(input_elements.size()) };
+
+		if (source.StreamOutput.pSODeclaration != nullptr && source.StreamOutput.NumEntries != 0)
+			stream_output_entries.assign(source.StreamOutput.pSODeclaration, source.StreamOutput.pSODeclaration + source.StreamOutput.NumEntries);
+		stream_output_semantic_names.reserve(stream_output_entries.size());
+		for (D3D12_SO_DECLARATION_ENTRY &entry : stream_output_entries)
+		{
+			stream_output_semantic_names.emplace_back(entry.SemanticName != nullptr ? entry.SemanticName : "");
+			entry.SemanticName = stream_output_semantic_names.back().c_str();
+		}
+		if (source.StreamOutput.pBufferStrides != nullptr && source.StreamOutput.NumStrides != 0)
+			stream_output_strides.assign(source.StreamOutput.pBufferStrides, source.StreamOutput.pBufferStrides + source.StreamOutput.NumStrides);
+		desc.StreamOutput = {
+			stream_output_entries.empty() ? nullptr : stream_output_entries.data(),
+			static_cast<UINT>(stream_output_entries.size()),
+			stream_output_strides.empty() ? nullptr : stream_output_strides.data(),
+			static_cast<UINT>(stream_output_strides.size()),
+			source.StreamOutput.RasterizedStream
+		};
 	}
 };
 
 struct CopiedComputePipelineDesc
 {
 	D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+	com_ptr<ID3D12RootSignature> root_signature;
 	std::vector<uint8_t> cs, cached_pso;
 
 	explicit CopiedComputePipelineDesc(const D3D12_COMPUTE_PIPELINE_STATE_DESC &source)
 	{
 		desc = source;
+		root_signature = source.pRootSignature;
+		desc.pRootSignature = root_signature.get();
 		CopiedGraphicsPipelineDesc::copy_bytecode(source.CS, cs, desc.CS);
 
 		if (source.CachedPSO.pCachedBlob != nullptr && source.CachedPSO.CachedBlobSizeInBytes != 0)
@@ -692,6 +721,211 @@ struct CopiedComputePipelineDesc
 		}
 		// Classic CreateComputePipelineState cannot reliably consume stream/library cached blobs.
 		desc.CachedPSO = {};
+	}
+};
+
+struct CopiedPipelineStateStream
+{
+	D3D12_PIPELINE_STATE_STREAM_DESC desc = {};
+	std::vector<uint8_t> stream;
+	std::vector<std::vector<uint8_t>> byte_storage;
+	std::vector<std::vector<char>> string_storage;
+	std::vector<std::vector<D3D12_INPUT_ELEMENT_DESC>> input_layout_storage;
+	std::vector<std::vector<D3D12_SO_DECLARATION_ENTRY>> stream_output_storage;
+	std::vector<std::vector<UINT>> stream_output_stride_storage;
+	std::vector<std::vector<D3D12_VIEW_INSTANCE_LOCATION>> view_instance_storage;
+	std::vector<com_ptr<ID3D12RootSignature>> root_signature_storage;
+	bool valid = false;
+
+	static size_t subobject_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type)
+	{
+		switch (type)
+		{
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: return sizeof(D3D12_PIPELINE_STATE_STREAM_ROOT_SIGNATURE);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: return sizeof(D3D12_PIPELINE_STATE_STREAM_VS);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: return sizeof(D3D12_PIPELINE_STATE_STREAM_PS);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: return sizeof(D3D12_PIPELINE_STATE_STREAM_DS);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: return sizeof(D3D12_PIPELINE_STATE_STREAM_HS);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: return sizeof(D3D12_PIPELINE_STATE_STREAM_GS);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: return sizeof(D3D12_PIPELINE_STATE_STREAM_CS);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: return sizeof(D3D12_PIPELINE_STATE_STREAM_STREAM_OUTPUT);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: return sizeof(D3D12_PIPELINE_STATE_STREAM_BLEND_DESC);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: return sizeof(D3D12_PIPELINE_STATE_STREAM_SAMPLE_MASK);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: return sizeof(D3D12_PIPELINE_STATE_STREAM_RASTERIZER);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: return sizeof(D3D12_PIPELINE_STATE_STREAM_DEPTH_STENCIL);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: return sizeof(D3D12_PIPELINE_STATE_STREAM_INPUT_LAYOUT);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: return sizeof(D3D12_PIPELINE_STATE_STREAM_IB_STRIP_CUT_VALUE);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: return sizeof(D3D12_PIPELINE_STATE_STREAM_PRIMITIVE_TOPOLOGY);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: return sizeof(D3D12_PIPELINE_STATE_STREAM_RENDER_TARGET_FORMATS);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: return sizeof(D3D12_PIPELINE_STATE_STREAM_DEPTH_STENCIL_FORMAT);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: return sizeof(D3D12_PIPELINE_STATE_STREAM_SAMPLE_DESC);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: return sizeof(D3D12_PIPELINE_STATE_STREAM_NODE_MASK);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: return sizeof(D3D12_PIPELINE_STATE_STREAM_CACHED_PSO);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: return sizeof(D3D12_PIPELINE_STATE_STREAM_FLAGS);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: return sizeof(D3D12_PIPELINE_STATE_STREAM_DEPTH_STENCIL1);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: return sizeof(D3D12_PIPELINE_STATE_STREAM_VIEW_INSTANCING);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: return sizeof(D3D12_PIPELINE_STATE_STREAM_AS);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: return sizeof(D3D12_PIPELINE_STATE_STREAM_MS);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: return sizeof(D3D12_PIPELINE_STATE_STREAM_DEPTH_STENCIL2);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1: return sizeof(D3D12_PIPELINE_STATE_STREAM_RASTERIZER1);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2: return sizeof(D3D12_PIPELINE_STATE_STREAM_RASTERIZER2);
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE: return sizeof(D3D12_PIPELINE_STATE_STREAM_SERIALIZED_ROOT_SIGNATURE);
+		default: return 0;
+		}
+	}
+
+	static void copy_byte_span(const void *source, size_t size, const void *&dest, std::vector<std::vector<uint8_t>> &storage)
+	{
+		if (source == nullptr || size == 0)
+		{
+			dest = nullptr;
+			return;
+		}
+
+		std::vector<uint8_t> copy(size);
+		std::memcpy(copy.data(), source, size);
+		storage.push_back(std::move(copy));
+		dest = storage.back().data();
+	}
+
+	static void copy_shader_bytecode(D3D12_SHADER_BYTECODE &bytecode, std::vector<std::vector<uint8_t>> &storage)
+	{
+		copy_byte_span(bytecode.pShaderBytecode, bytecode.BytecodeLength, bytecode.pShaderBytecode, storage);
+	}
+
+	static void copy_cached_pso(D3D12_CACHED_PIPELINE_STATE &cached_pso, std::vector<std::vector<uint8_t>> &storage)
+	{
+		copy_byte_span(cached_pso.pCachedBlob, cached_pso.CachedBlobSizeInBytes, cached_pso.pCachedBlob, storage);
+	}
+
+	static void copy_serialized_root_signature(D3D12_SERIALIZED_ROOT_SIGNATURE_DESC &root_signature, std::vector<std::vector<uint8_t>> &storage)
+	{
+		copy_byte_span(root_signature.pSerializedBlob, root_signature.SerializedBlobSizeInBytes, root_signature.pSerializedBlob, storage);
+	}
+
+	const char *copy_string(const char *source)
+	{
+		if (source == nullptr)
+			return nullptr;
+
+		const size_t size = std::strlen(source) + 1;
+		std::vector<char> copy(size);
+		std::memcpy(copy.data(), source, size);
+		string_storage.push_back(std::move(copy));
+		return string_storage.back().data();
+	}
+
+	explicit CopiedPipelineStateStream(const D3D12_PIPELINE_STATE_STREAM_DESC &source)
+	{
+		if (source.pPipelineStateSubobjectStream == nullptr || source.SizeInBytes == 0)
+			return;
+
+		stream.resize(source.SizeInBytes);
+		std::memcpy(stream.data(), source.pPipelineStateSubobjectStream, source.SizeInBytes);
+		desc = { stream.size(), stream.data() };
+
+		const uintptr_t original_base = reinterpret_cast<uintptr_t>(source.pPipelineStateSubobjectStream);
+		const uintptr_t original_end = original_base + source.SizeInBytes;
+		for (uintptr_t original_p = original_base, copied_p = reinterpret_cast<uintptr_t>(stream.data()); original_p < original_end;)
+		{
+			if (original_p + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) > original_end)
+				return;
+
+			const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *>(original_p);
+			const size_t size = subobject_size(type);
+			if (size == 0 || original_p + size > original_end)
+				return;
+
+			switch (type)
+			{
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
+			{
+				ID3D12RootSignature *&root_signature = reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_ROOT_SIGNATURE *>(copied_p)->data;
+				if (root_signature != nullptr)
+				{
+					root_signature_storage.emplace_back(root_signature);
+					root_signature = root_signature_storage.back().get();
+				}
+				break;
+			}
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+				copy_shader_bytecode(reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_VS *>(copied_p)->data, byte_storage);
+				break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+				copy_shader_bytecode(reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_PS *>(copied_p)->data, byte_storage);
+				break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+				copy_shader_bytecode(reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_DS *>(copied_p)->data, byte_storage);
+				break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+				copy_shader_bytecode(reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_HS *>(copied_p)->data, byte_storage);
+				break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+				copy_shader_bytecode(reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_GS *>(copied_p)->data, byte_storage);
+				break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+				copy_shader_bytecode(reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_CS *>(copied_p)->data, byte_storage);
+				break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+				copy_shader_bytecode(reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_AS *>(copied_p)->data, byte_storage);
+				break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+				copy_shader_bytecode(reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_MS *>(copied_p)->data, byte_storage);
+				break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE:
+				copy_serialized_root_signature(reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_SERIALIZED_ROOT_SIGNATURE *>(copied_p)->data, byte_storage);
+				break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+				copy_cached_pso(reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_CACHED_PSO *>(copied_p)->data, byte_storage);
+				break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT:
+			{
+				D3D12_INPUT_LAYOUT_DESC &layout = reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_INPUT_LAYOUT *>(copied_p)->data;
+				if (layout.pInputElementDescs != nullptr && layout.NumElements != 0)
+				{
+					input_layout_storage.emplace_back(layout.pInputElementDescs, layout.pInputElementDescs + layout.NumElements);
+					for (D3D12_INPUT_ELEMENT_DESC &element : input_layout_storage.back())
+						element.SemanticName = copy_string(element.SemanticName);
+					layout.pInputElementDescs = input_layout_storage.back().data();
+				}
+				break;
+			}
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT:
+			{
+				D3D12_STREAM_OUTPUT_DESC &stream_output = reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_STREAM_OUTPUT *>(copied_p)->data;
+				if (stream_output.pSODeclaration != nullptr && stream_output.NumEntries != 0)
+				{
+					stream_output_storage.emplace_back(stream_output.pSODeclaration, stream_output.pSODeclaration + stream_output.NumEntries);
+					for (D3D12_SO_DECLARATION_ENTRY &entry : stream_output_storage.back())
+						entry.SemanticName = copy_string(entry.SemanticName);
+					stream_output.pSODeclaration = stream_output_storage.back().data();
+				}
+				if (stream_output.pBufferStrides != nullptr && stream_output.NumStrides != 0)
+				{
+					stream_output_stride_storage.emplace_back(stream_output.pBufferStrides, stream_output.pBufferStrides + stream_output.NumStrides);
+					stream_output.pBufferStrides = stream_output_stride_storage.back().data();
+				}
+				break;
+			}
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
+			{
+				D3D12_VIEW_INSTANCING_DESC &view_instancing = reinterpret_cast<D3D12_PIPELINE_STATE_STREAM_VIEW_INSTANCING *>(copied_p)->data;
+				if (view_instancing.pViewInstanceLocations != nullptr && view_instancing.ViewInstanceCount != 0)
+				{
+					view_instance_storage.emplace_back(view_instancing.pViewInstanceLocations, view_instancing.pViewInstanceLocations + view_instancing.ViewInstanceCount);
+					view_instancing.pViewInstanceLocations = view_instance_storage.back().data();
+				}
+				break;
+			}
+			default:
+				break;
+			}
+
+			original_p += size;
+			copied_p += size;
+		}
+
+		valid = true;
 	}
 };
 
@@ -752,8 +986,6 @@ static D3D12_DEPTH_STENCIL_DESC make_default_depth_stencil_desc()
 
 static bool convert_depth_stencil_desc1(const D3D12_DEPTH_STENCIL_DESC1 &source, D3D12_DEPTH_STENCIL_DESC &dest)
 {
-	if (source.DepthBoundsTestEnable != FALSE)
-		return false;
 	dest.DepthEnable = source.DepthEnable;
 	dest.DepthWriteMask = source.DepthWriteMask;
 	dest.DepthFunc = source.DepthFunc;
@@ -763,6 +995,59 @@ static bool convert_depth_stencil_desc1(const D3D12_DEPTH_STENCIL_DESC1 &source,
 	dest.FrontFace = source.FrontFace;
 	dest.BackFace = source.BackFace;
 	return true;
+}
+
+static bool convert_depth_stencil_desc2(const D3D12_DEPTH_STENCIL_DESC2 &source, D3D12_DEPTH_STENCIL_DESC &dest)
+{
+	dest.DepthEnable = source.DepthEnable;
+	dest.DepthWriteMask = source.DepthWriteMask;
+	dest.DepthFunc = source.DepthFunc;
+	dest.StencilEnable = source.StencilEnable;
+	dest.StencilReadMask = source.FrontFace.StencilReadMask;
+	dest.StencilWriteMask = source.FrontFace.StencilWriteMask;
+	dest.FrontFace.StencilFailOp = source.FrontFace.StencilFailOp;
+	dest.FrontFace.StencilDepthFailOp = source.FrontFace.StencilDepthFailOp;
+	dest.FrontFace.StencilPassOp = source.FrontFace.StencilPassOp;
+	dest.FrontFace.StencilFunc = source.FrontFace.StencilFunc;
+	dest.BackFace.StencilFailOp = source.BackFace.StencilFailOp;
+	dest.BackFace.StencilDepthFailOp = source.BackFace.StencilDepthFailOp;
+	dest.BackFace.StencilPassOp = source.BackFace.StencilPassOp;
+	dest.BackFace.StencilFunc = source.BackFace.StencilFunc;
+	return true;
+}
+
+static D3D12_RASTERIZER_DESC convert_rasterizer_desc1(const D3D12_RASTERIZER_DESC1 &source)
+{
+	D3D12_RASTERIZER_DESC dest = {};
+	dest.FillMode = source.FillMode;
+	dest.CullMode = source.CullMode;
+	dest.FrontCounterClockwise = source.FrontCounterClockwise;
+	dest.DepthBias = static_cast<INT>(source.DepthBias);
+	dest.DepthBiasClamp = source.DepthBiasClamp;
+	dest.SlopeScaledDepthBias = source.SlopeScaledDepthBias;
+	dest.DepthClipEnable = source.DepthClipEnable;
+	dest.MultisampleEnable = source.MultisampleEnable;
+	dest.AntialiasedLineEnable = source.AntialiasedLineEnable;
+	dest.ForcedSampleCount = source.ForcedSampleCount;
+	dest.ConservativeRaster = source.ConservativeRaster;
+	return dest;
+}
+
+static D3D12_RASTERIZER_DESC convert_rasterizer_desc2(const D3D12_RASTERIZER_DESC2 &source)
+{
+	D3D12_RASTERIZER_DESC dest = {};
+	dest.FillMode = source.FillMode;
+	dest.CullMode = source.CullMode;
+	dest.FrontCounterClockwise = source.FrontCounterClockwise;
+	dest.DepthBias = static_cast<INT>(source.DepthBias);
+	dest.DepthBiasClamp = source.DepthBiasClamp;
+	dest.SlopeScaledDepthBias = source.SlopeScaledDepthBias;
+	dest.DepthClipEnable = source.DepthClipEnable;
+	dest.MultisampleEnable = FALSE;
+	dest.AntialiasedLineEnable = source.LineRasterizationMode != D3D12_LINE_RASTERIZATION_MODE_ALIASED;
+	dest.ForcedSampleCount = source.ForcedSampleCount;
+	dest.ConservativeRaster = source.ConservativeRaster;
+	return dest;
 }
 
 static bool convert_pipeline_state_stream_to_graphics_desc(const D3D12_PIPELINE_STATE_STREAM_DESC &stream_desc, D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, const char *&unsupported_reason, bool &has_cached_pso)
@@ -785,6 +1070,7 @@ static bool convert_pipeline_state_stream_to_graphics_desc(const D3D12_PIPELINE_
 	desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
 
 	bool has_graphics_shader = false;
+	bool has_mesh_shader = false;
 	const uintptr_t end = reinterpret_cast<uintptr_t>(stream_desc.pPipelineStateSubobjectStream) + stream_desc.SizeInBytes;
 	for (uintptr_t p = reinterpret_cast<uintptr_t>(stream_desc.pPipelineStateSubobjectStream); p < end;)
 	{
@@ -905,35 +1191,52 @@ static bool convert_pipeline_state_stream_to_graphics_desc(const D3D12_PIPELINE_
 			if (!convert_depth_stencil_desc1(reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DEPTH_STENCIL1 *>(p)->data, desc.DepthStencilState)) { unsupported_reason = "DEPTH_STENCIL1 uses depth bounds"; return false; }
 			p += sizeof(D3D12_PIPELINE_STATE_STREAM_DEPTH_STENCIL1);
 			continue;
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
+			if (p + sizeof(D3D12_PIPELINE_STATE_STREAM_VIEW_INSTANCING) > end) { unsupported_reason = "stream truncated in VIEW_INSTANCING"; return false; }
+			p += sizeof(D3D12_PIPELINE_STATE_STREAM_VIEW_INSTANCING);
+			continue;
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2:
+			if (p + sizeof(D3D12_PIPELINE_STATE_STREAM_DEPTH_STENCIL2) > end) { unsupported_reason = "stream truncated in DEPTH_STENCIL2"; return false; }
+			if (!convert_depth_stencil_desc2(reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DEPTH_STENCIL2 *>(p)->data, desc.DepthStencilState)) { unsupported_reason = "DEPTH_STENCIL2 conversion failed"; return false; }
+			p += sizeof(D3D12_PIPELINE_STATE_STREAM_DEPTH_STENCIL2);
+			continue;
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1:
+			if (p + sizeof(D3D12_PIPELINE_STATE_STREAM_RASTERIZER1) > end) { unsupported_reason = "stream truncated in RASTERIZER1"; return false; }
+			desc.RasterizerState = convert_rasterizer_desc1(reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_RASTERIZER1 *>(p)->data);
+			p += sizeof(D3D12_PIPELINE_STATE_STREAM_RASTERIZER1);
+			continue;
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2:
+			if (p + sizeof(D3D12_PIPELINE_STATE_STREAM_RASTERIZER2) > end) { unsupported_reason = "stream truncated in RASTERIZER2"; return false; }
+			desc.RasterizerState = convert_rasterizer_desc2(reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_RASTERIZER2 *>(p)->data);
+			p += sizeof(D3D12_PIPELINE_STATE_STREAM_RASTERIZER2);
+			continue;
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE:
+			if (p + sizeof(D3D12_PIPELINE_STATE_STREAM_SERIALIZED_ROOT_SIGNATURE) > end) { unsupported_reason = "stream truncated in SERIALIZED_ROOT_SIGNATURE"; return false; }
+			if constexpr (!use_global_sentinel_fallback_pso) { unsupported_reason = "stream uses serialized root signature without sentinel fallback"; return false; }
+			desc.pRootSignature = nullptr;
+			p += sizeof(D3D12_PIPELINE_STATE_STREAM_SERIALIZED_ROOT_SIGNATURE);
+			continue;
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
 			unsupported_reason = "stream is compute (CS)";
 			return false;
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
-			unsupported_reason = "stream uses amplification shader (AS)";
-			return false;
+			if (p + sizeof(D3D12_PIPELINE_STATE_STREAM_AS) > end) { unsupported_reason = "stream truncated in AS"; return false; }
+			p += sizeof(D3D12_PIPELINE_STATE_STREAM_AS);
+			continue;
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
-			unsupported_reason = "stream uses mesh shader (MS)";
-			return false;
-		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
-			unsupported_reason = "stream uses view instancing";
-			return false;
-		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2:
-			unsupported_reason = "stream uses DEPTH_STENCIL2";
-			return false;
-		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1:
-			unsupported_reason = "stream uses RASTERIZER1";
-			return false;
-		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2:
-			unsupported_reason = "stream uses RASTERIZER2";
-			return false;
-		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE:
-			unsupported_reason = "stream uses serialized root signature";
-			return false;
+			if (p + sizeof(D3D12_PIPELINE_STATE_STREAM_MS) > end) { unsupported_reason = "stream truncated in MS"; return false; }
+			has_mesh_shader = reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_MS *>(p)->data.pShaderBytecode != nullptr;
+			has_graphics_shader = has_graphics_shader || has_mesh_shader;
+			p += sizeof(D3D12_PIPELINE_STATE_STREAM_MS);
+			continue;
 		default:
 			unsupported_reason = "stream uses unknown subobject";
 			return false;
 		}
 	}
+
+	if (has_mesh_shader && desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED)
+		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 
 	if (!has_graphics_shader)
 	{
@@ -993,6 +1296,12 @@ static bool convert_pipeline_state_stream_to_compute_desc(const D3D12_PIPELINE_S
 			if (p + sizeof(D3D12_PIPELINE_STATE_STREAM_FLAGS) > end) { unsupported_reason = "stream truncated in FLAGS"; return false; }
 			desc.Flags = reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_FLAGS *>(p)->data;
 			p += sizeof(D3D12_PIPELINE_STATE_STREAM_FLAGS);
+			continue;
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE:
+			if (p + sizeof(D3D12_PIPELINE_STATE_STREAM_SERIALIZED_ROOT_SIGNATURE) > end) { unsupported_reason = "stream truncated in SERIALIZED_ROOT_SIGNATURE"; return false; }
+			if constexpr (!use_global_sentinel_fallback_pso) { unsupported_reason = "stream uses serialized root signature without sentinel fallback"; return false; }
+			desc.pRootSignature = nullptr;
+			p += sizeof(D3D12_PIPELINE_STATE_STREAM_SERIALIZED_ROOT_SIGNATURE);
 			continue;
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
@@ -1111,7 +1420,7 @@ public:
 
 		const char *unsupported_reason = "none";
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC working_desc = *desc;
-		if (!is_supported(working_desc, unsupported_reason))
+		if (!is_supported(working_desc, unsupported_reason, true, use_global_sentinel_fallback_pso))
 		{
 			note_async_pipeline_unsupported_desc(unsupported_reason);
 			return _device->CreateGraphicsPipelineState(desc, riid, pipeline_state);
@@ -1176,7 +1485,7 @@ public:
 
 		const char *unsupported_reason = "none";
 		D3D12_COMPUTE_PIPELINE_STATE_DESC working_desc = *desc;
-		if (!is_supported(working_desc, unsupported_reason))
+		if (!is_supported(working_desc, unsupported_reason, use_global_sentinel_fallback_pso))
 		{
 			note_async_pipeline_unsupported_desc(unsupported_reason);
 			return _device->CreateComputePipelineState(desc, riid, pipeline_state);
@@ -1238,6 +1547,9 @@ public:
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics_desc = {};
 		bool graphics_has_cached_pso = false;
 		const char *graphics_unsupported_reason = "none";
+		D3D12_COMPUTE_PIPELINE_STATE_DESC compute_desc = {};
+		bool compute_has_cached_pso = false;
+		const char *compute_unsupported_reason = "none";
 		if (convert_pipeline_state_stream_to_graphics_desc(*stream_desc, graphics_desc, graphics_unsupported_reason, graphics_has_cached_pso))
 		{
 			if constexpr (!async_graphics_fallback_enabled)
@@ -1250,7 +1562,7 @@ public:
 				note_async_pipeline_unsupported_desc("graphics stream uses cached PSO / pipeline library");
 				goto sync_with_events;
 			}
-			if (!is_supported(graphics_desc, graphics_unsupported_reason))
+			if (!is_supported(graphics_desc, graphics_unsupported_reason, true, use_global_sentinel_fallback_pso))
 			{
 				note_async_pipeline_unsupported_desc(graphics_unsupported_reason);
 				goto sync_with_events;
@@ -1267,13 +1579,20 @@ public:
 
 			const uint64_t id = _next_proxy_id.fetch_add(1, std::memory_order_relaxed);
 			D3D12AsyncPipelineProxy *const proxy = new D3D12AsyncPipelineProxy(this, _device, fallback.get(), id);
+			std::unique_ptr<CopiedPipelineStateStream> copied_stream_desc = std::make_unique<CopiedPipelineStateStream>(*stream_desc);
+			if (!copied_stream_desc->valid)
+			{
+				proxy->Release();
+				note_async_pipeline_unsupported_desc("graphics stream copy failed");
+				goto sync_with_events;
+			}
 
 			bool notify_worker = false;
 			{
 				std::lock_guard<std::mutex> lock(_queue_mutex);
 				CompileJob job = {};
 				job.proxy = proxy;
-				job.graphics_desc = std::make_unique<CopiedGraphicsPipelineDesc>(graphics_desc);
+				job.stream_desc = std::move(copied_stream_desc);
 				job.id = id;
 				_compile_queue.push_back(std::move(job));
 				notify_worker = _compile_queue.size() <= _compile_worker_count;
@@ -1289,9 +1608,6 @@ public:
 			return S_OK;
 		}
 
-		D3D12_COMPUTE_PIPELINE_STATE_DESC compute_desc = {};
-		bool compute_has_cached_pso = false;
-		const char *compute_unsupported_reason = "none";
 		if (convert_pipeline_state_stream_to_compute_desc(*stream_desc, compute_desc, compute_unsupported_reason, compute_has_cached_pso))
 		{
 			if constexpr (!async_compute_fallback_enabled)
@@ -1304,7 +1620,7 @@ public:
 				note_async_pipeline_unsupported_desc("compute stream uses cached PSO / pipeline library");
 				goto sync_with_events;
 			}
-			if (!is_supported(compute_desc, compute_unsupported_reason))
+			if (!is_supported(compute_desc, compute_unsupported_reason, use_global_sentinel_fallback_pso))
 			{
 				note_async_pipeline_unsupported_desc(compute_unsupported_reason);
 				goto sync_with_events;
@@ -1321,13 +1637,20 @@ public:
 
 			const uint64_t id = _next_proxy_id.fetch_add(1, std::memory_order_relaxed);
 			D3D12AsyncPipelineProxy *const proxy = new D3D12AsyncPipelineProxy(this, _device, fallback.get(), id);
+			std::unique_ptr<CopiedPipelineStateStream> copied_stream_desc = std::make_unique<CopiedPipelineStateStream>(*stream_desc);
+			if (!copied_stream_desc->valid)
+			{
+				proxy->Release();
+				note_async_pipeline_unsupported_desc("compute stream copy failed");
+				goto sync_with_events;
+			}
 
 			bool notify_worker = false;
 			{
 				std::lock_guard<std::mutex> lock(_queue_mutex);
 				CompileJob job = {};
 				job.proxy = proxy;
-				job.compute_desc = std::make_unique<CopiedComputePipelineDesc>(compute_desc);
+				job.stream_desc = std::move(copied_stream_desc);
 				job.id = id;
 				_compile_queue.push_back(std::move(job));
 				notify_worker = _compile_queue.size() <= _compile_worker_count;
@@ -1370,13 +1693,14 @@ private:
 		D3D12AsyncPipelineProxy *proxy = nullptr;
 		std::unique_ptr<CopiedGraphicsPipelineDesc> graphics_desc;
 		std::unique_ptr<CopiedComputePipelineDesc> compute_desc;
+		std::unique_ptr<CopiedPipelineStateStream> stream_desc;
 		uint64_t id = 0;
 	};
 
-	static bool is_supported(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, const char *&unsupported_reason)
+	static bool is_supported(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, const char *&unsupported_reason, bool allow_stream_output = false, bool allow_null_root_signature = false)
 	{
 		unsupported_reason = "none";
-		if (desc.pRootSignature == nullptr)
+		if (!allow_null_root_signature && desc.pRootSignature == nullptr)
 		{
 			unsupported_reason = "graphics desc has null root signature";
 			return false;
@@ -1386,29 +1710,9 @@ private:
 			unsupported_reason = "graphics desc uses MSAA/sample quality";
 			return false;
 		}
-		if (desc.HS.pShaderBytecode != nullptr)
-		{
-			unsupported_reason = "graphics desc uses hull shader";
-			return false;
-		}
-		if (desc.DS.pShaderBytecode != nullptr)
-		{
-			unsupported_reason = "graphics desc uses domain shader";
-			return false;
-		}
-		if (desc.GS.pShaderBytecode != nullptr)
-		{
-			unsupported_reason = "graphics desc uses geometry shader";
-			return false;
-		}
-		if (desc.StreamOutput.NumEntries != 0 || desc.StreamOutput.NumStrides != 0)
+		if (!allow_stream_output && (desc.StreamOutput.NumEntries != 0 || desc.StreamOutput.NumStrides != 0))
 		{
 			unsupported_reason = "graphics desc uses stream output";
-			return false;
-		}
-		if (desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
-		{
-			unsupported_reason = "graphics desc uses patch topology";
 			return false;
 		}
 		if (desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED)
@@ -1429,10 +1733,10 @@ private:
 		return true;
 	}
 
-	static bool is_supported(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, const char *&unsupported_reason)
+	static bool is_supported(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, const char *&unsupported_reason, bool allow_null_root_signature = false)
 	{
 		unsupported_reason = "none";
-		if (desc.pRootSignature == nullptr)
+		if (!allow_null_root_signature && desc.pRootSignature == nullptr)
 		{
 			unsupported_reason = "compute desc has null root signature";
 			return false;
@@ -1475,6 +1779,37 @@ private:
 		return key;
 	}
 
+	HRESULT get_or_create_dummy_root_signature(com_ptr<ID3D12RootSignature> &root_signature)
+	{
+		{
+			std::lock_guard<std::mutex> lock(_dummy_root_signature_mutex);
+			if (_dummy_root_signature != nullptr)
+			{
+				root_signature = _dummy_root_signature;
+				return S_OK;
+			}
+		}
+
+		D3D12_ROOT_SIGNATURE_DESC desc = {};
+		desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+		com_ptr<ID3DBlob> blob, error_blob;
+		HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error_blob);
+		if (FAILED(hr))
+			return hr;
+
+		com_ptr<ID3D12RootSignature> created;
+		hr = _device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&created));
+		if (FAILED(hr))
+			return hr;
+
+		std::lock_guard<std::mutex> lock(_dummy_root_signature_mutex);
+		if (_dummy_root_signature == nullptr)
+			_dummy_root_signature = created;
+		root_signature = _dummy_root_signature;
+		return S_OK;
+	}
+
 	HRESULT get_or_create_fallback(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &source_desc, com_ptr<ID3D12PipelineState> &fallback)
 	{
 		GraphicsFallbackKey key = make_key(source_desc);
@@ -1505,9 +1840,16 @@ private:
 
 		D3D12_SHADER_BYTECODE vs = {}, ps = {};
 		ensure_fallback_shaders(vs, ps);
+		com_ptr<ID3D12RootSignature> dummy_root_signature;
+		if constexpr (use_global_sentinel_fallback_pso)
+		{
+			const HRESULT root_signature_hr = get_or_create_dummy_root_signature(dummy_root_signature);
+			if (FAILED(root_signature_hr))
+				return root_signature_hr;
+		}
 
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC fallback_desc = {};
-		fallback_desc.pRootSignature = source_desc.pRootSignature;
+		fallback_desc.pRootSignature = use_global_sentinel_fallback_pso ? dummy_root_signature.get() : source_desc.pRootSignature;
 		fallback_desc.VS = vs;
 		fallback_desc.PS = ps;
 		fallback_desc.BlendState.AlphaToCoverageEnable = FALSE;
@@ -1545,7 +1887,7 @@ private:
 		fallback_desc.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
 		fallback_desc.InputLayout = {};
 		fallback_desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
-		fallback_desc.PrimitiveTopologyType = key.primitive_topology_type;
+		fallback_desc.PrimitiveTopologyType = key.primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH ? key.primitive_topology_type : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 		fallback_desc.NumRenderTargets = key.num_render_targets;
 		std::memcpy(fallback_desc.RTVFormats, key.rtv_formats, sizeof(fallback_desc.RTVFormats));
 		fallback_desc.DSVFormat = key.dsv_format;
@@ -1622,9 +1964,16 @@ private:
 
 		D3D12_SHADER_BYTECODE cs = {};
 		ensure_compute_fallback_shader(cs);
+		com_ptr<ID3D12RootSignature> dummy_root_signature;
+		if constexpr (use_global_sentinel_fallback_pso)
+		{
+			const HRESULT root_signature_hr = get_or_create_dummy_root_signature(dummy_root_signature);
+			if (FAILED(root_signature_hr))
+				return root_signature_hr;
+		}
 
 		D3D12_COMPUTE_PIPELINE_STATE_DESC fallback_desc = {};
-		fallback_desc.pRootSignature = source_desc.pRootSignature;
+		fallback_desc.pRootSignature = use_global_sentinel_fallback_pso ? dummy_root_signature.get() : source_desc.pRootSignature;
 		fallback_desc.CS = cs;
 		fallback_desc.NodeMask = source_desc.NodeMask;
 		fallback_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
@@ -1679,6 +2028,161 @@ private:
 		cs = { reshade::d3d12::async_pipeline_shaders::fallback_cs, sizeof(reshade::d3d12::async_pipeline_shaders::fallback_cs) };
 	}
 
+	static uint64_t hash_bytes(const void *data, size_t size)
+	{
+		if (data == nullptr || size == 0)
+			return 0;
+
+		uint64_t hash = 14695981039346656037ull;
+		const uint8_t *const bytes = static_cast<const uint8_t *>(data);
+		for (size_t i = 0; i < size; ++i)
+		{
+			hash ^= bytes[i];
+			hash *= 1099511628211ull;
+		}
+		return hash;
+	}
+
+	static void log_shader_bytecode(uint64_t id, const char *name, const D3D12_SHADER_BYTECODE &bytecode)
+	{
+		if constexpr (async_pipeline_debug_diagnostics)
+			reshade::log::message(reshade::log::level::info, "Async D3D12 PSO proxy %llu:   %-3s ptr=%p size=%zu hash=0x%016llx.",
+				static_cast<unsigned long long>(id), name, bytecode.pShaderBytecode, bytecode.BytecodeLength,
+				static_cast<unsigned long long>(hash_bytes(bytecode.pShaderBytecode, bytecode.BytecodeLength)));
+	}
+
+	static void log_graphics_pipeline_desc(uint64_t id, const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc)
+	{
+		if constexpr (async_pipeline_debug_diagnostics)
+		{
+			reshade::log::message(reshade::log::level::info,
+				"Async D3D12 PSO proxy %llu: graphics real desc root=%p node=%u flags=0x%x topology=%u sample=%u/%u rts=%u dsv=%u depth=%u stencil=%u cached=%p/%zu input=%u so_entries=%u so_strides=%u.",
+				static_cast<unsigned long long>(id), desc.pRootSignature, desc.NodeMask, desc.Flags, desc.PrimitiveTopologyType,
+				desc.SampleDesc.Count, desc.SampleDesc.Quality, desc.NumRenderTargets, desc.DSVFormat,
+				desc.DepthStencilState.DepthEnable != FALSE, desc.DepthStencilState.StencilEnable != FALSE,
+				desc.CachedPSO.pCachedBlob, desc.CachedPSO.CachedBlobSizeInBytes,
+				desc.InputLayout.NumElements, desc.StreamOutput.NumEntries, desc.StreamOutput.NumStrides);
+			reshade::log::message(reshade::log::level::info,
+				"Async D3D12 PSO proxy %llu:   RTV formats = [%u, %u, %u, %u, %u, %u, %u, %u].",
+				static_cast<unsigned long long>(id), desc.RTVFormats[0], desc.RTVFormats[1], desc.RTVFormats[2], desc.RTVFormats[3], desc.RTVFormats[4], desc.RTVFormats[5], desc.RTVFormats[6], desc.RTVFormats[7]);
+			log_shader_bytecode(id, "VS", desc.VS);
+			log_shader_bytecode(id, "PS", desc.PS);
+			log_shader_bytecode(id, "DS", desc.DS);
+			log_shader_bytecode(id, "HS", desc.HS);
+			log_shader_bytecode(id, "GS", desc.GS);
+		}
+	}
+
+	static void log_compute_pipeline_desc(uint64_t id, const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc)
+	{
+		if constexpr (async_pipeline_debug_diagnostics)
+		{
+			reshade::log::message(reshade::log::level::info,
+				"Async D3D12 PSO proxy %llu: compute real desc root=%p node=%u flags=0x%x cached=%p/%zu.",
+				static_cast<unsigned long long>(id), desc.pRootSignature, desc.NodeMask, desc.Flags,
+				desc.CachedPSO.pCachedBlob, desc.CachedPSO.CachedBlobSizeInBytes);
+			log_shader_bytecode(id, "CS", desc.CS);
+		}
+	}
+
+	static const char *subobject_type_name(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type)
+	{
+		switch (type)
+		{
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: return "ROOT_SIGNATURE";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: return "VS";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: return "PS";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: return "DS";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: return "HS";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: return "GS";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: return "CS";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: return "STREAM_OUTPUT";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: return "BLEND";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: return "SAMPLE_MASK";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: return "RASTERIZER";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: return "DEPTH_STENCIL";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: return "INPUT_LAYOUT";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: return "IB_STRIP_CUT_VALUE";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: return "PRIMITIVE_TOPOLOGY";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: return "RENDER_TARGET_FORMATS";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: return "DEPTH_STENCIL_FORMAT";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: return "SAMPLE_DESC";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: return "NODE_MASK";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: return "CACHED_PSO";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: return "FLAGS";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: return "DEPTH_STENCIL1";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: return "VIEW_INSTANCING";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: return "AS";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: return "MS";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: return "DEPTH_STENCIL2";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1: return "RASTERIZER1";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2: return "RASTERIZER2";
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE: return "SERIALIZED_ROOT_SIGNATURE";
+		default: return "UNKNOWN";
+		}
+	}
+
+	static void log_pipeline_state_stream_desc(uint64_t id, const D3D12_PIPELINE_STATE_STREAM_DESC &desc)
+	{
+		if constexpr (async_pipeline_debug_diagnostics)
+		{
+			reshade::log::message(reshade::log::level::info, "Async D3D12 PSO proxy %llu: stream real desc ptr=%p size=%zu.",
+				static_cast<unsigned long long>(id), desc.pPipelineStateSubobjectStream, desc.SizeInBytes);
+
+			if (desc.pPipelineStateSubobjectStream == nullptr || desc.SizeInBytes == 0)
+				return;
+
+			const uintptr_t end = reinterpret_cast<uintptr_t>(desc.pPipelineStateSubobjectStream) + desc.SizeInBytes;
+			unsigned int index = 0;
+			for (uintptr_t p = reinterpret_cast<uintptr_t>(desc.pPipelineStateSubobjectStream); p < end; ++index)
+			{
+				if (p + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) > end)
+				{
+					reshade::log::message(reshade::log::level::warning, "Async D3D12 PSO proxy %llu:   stream[%u] truncated before type at offset %zu.", static_cast<unsigned long long>(id), index, static_cast<size_t>(p - reinterpret_cast<uintptr_t>(desc.pPipelineStateSubobjectStream)));
+					return;
+				}
+
+				const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *>(p);
+				const size_t size = CopiedPipelineStateStream::subobject_size(type);
+				reshade::log::message(reshade::log::level::info, "Async D3D12 PSO proxy %llu:   stream[%u] type=%s(%u) offset=%zu size=%zu.",
+					static_cast<unsigned long long>(id), index, subobject_type_name(type), type, static_cast<size_t>(p - reinterpret_cast<uintptr_t>(desc.pPipelineStateSubobjectStream)), size);
+				if (size == 0 || p + size > end)
+				{
+					reshade::log::message(reshade::log::level::warning, "Async D3D12 PSO proxy %llu:   stream[%u] has invalid size; stream is malformed.", static_cast<unsigned long long>(id), index);
+					return;
+				}
+
+				switch (type)
+				{
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: log_shader_bytecode(id, "VS", reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_VS *>(p)->data); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: log_shader_bytecode(id, "PS", reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_PS *>(p)->data); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: log_shader_bytecode(id, "DS", reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DS *>(p)->data); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: log_shader_bytecode(id, "HS", reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_HS *>(p)->data); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: log_shader_bytecode(id, "GS", reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_GS *>(p)->data); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: log_shader_bytecode(id, "CS", reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_CS *>(p)->data); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: log_shader_bytecode(id, "AS", reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_AS *>(p)->data); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: log_shader_bytecode(id, "MS", reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_MS *>(p)->data); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+				{
+					const D3D12_CACHED_PIPELINE_STATE &cached_pso = reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_CACHED_PSO *>(p)->data;
+					reshade::log::message(reshade::log::level::info, "Async D3D12 PSO proxy %llu:     cached_pso ptr=%p size=%zu hash=0x%016llx.", static_cast<unsigned long long>(id), cached_pso.pCachedBlob, cached_pso.CachedBlobSizeInBytes, static_cast<unsigned long long>(hash_bytes(cached_pso.pCachedBlob, cached_pso.CachedBlobSizeInBytes)));
+					break;
+				}
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE:
+				{
+					const D3D12_SERIALIZED_ROOT_SIGNATURE_DESC &root_signature = reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_SERIALIZED_ROOT_SIGNATURE *>(p)->data;
+					reshade::log::message(reshade::log::level::info, "Async D3D12 PSO proxy %llu:     serialized_root_signature ptr=%p size=%zu hash=0x%016llx.", static_cast<unsigned long long>(id), root_signature.pSerializedBlob, root_signature.SerializedBlobSizeInBytes, static_cast<unsigned long long>(hash_bytes(root_signature.pSerializedBlob, root_signature.SerializedBlobSizeInBytes)));
+					break;
+				}
+				default:
+					break;
+				}
+
+				p += size;
+			}
+		}
+	}
+
 	void worker_loop()
 	{
 		for (;;)
@@ -1717,7 +2221,9 @@ private:
 			bool handled_by_addon_events = false;
 #if RESHADE_ADDON >= 2
 			ID3D12PipelineState *event_pipeline = nullptr;
-			if (job.graphics_desc != nullptr)
+			if (job.stream_desc != nullptr)
+				handled_by_addon_events = _device_proxy->invoke_create_and_init_pipeline_event(job.stream_desc->desc, event_pipeline, hr, true);
+			else if (job.graphics_desc != nullptr)
 				handled_by_addon_events = _device_proxy->invoke_create_and_init_pipeline_event(job.graphics_desc->desc, event_pipeline, hr, true);
 			else if (job.compute_desc != nullptr)
 				handled_by_addon_events = _device_proxy->invoke_create_and_init_pipeline_event(job.compute_desc->desc, event_pipeline, hr, true);
@@ -1725,7 +2231,14 @@ private:
 			if (handled_by_addon_events && SUCCEEDED(hr))
 				real = com_ptr<ID3D12PipelineState>(event_pipeline, true);
 #endif
-			if (!handled_by_addon_events && job.graphics_desc != nullptr)
+			if (!handled_by_addon_events && job.stream_desc != nullptr)
+			{
+				com_ptr<ID3D12Device2> device2;
+				hr = _device->QueryInterface(&device2);
+				if (SUCCEEDED(hr))
+					hr = device2->CreatePipelineState(&job.stream_desc->desc, IID_PPV_ARGS(&real));
+			}
+			else if (!handled_by_addon_events && job.graphics_desc != nullptr)
 			{
 				hr = _device->CreateGraphicsPipelineState(&job.graphics_desc->desc, IID_PPV_ARGS(&real));
 			}
@@ -1745,7 +2258,16 @@ private:
 			else
 			{
 				g_async_pipeline_diagnostics.async_compile_failures.fetch_add(1, std::memory_order_relaxed);
-				reshade::log::message(reshade::log::level::warning, "Async D3D12 PSO proxy %llu: real PSO creation failed with error code %s; keeping fallback bound.", static_cast<unsigned long long>(job.id), reshade::log::hr_to_string(hr).c_str());
+				reshade::log::message(reshade::log::level::warning, "Async D3D12 PSO proxy %llu: real PSO creation failed with error code %s; keeping fallback bound (handled_by_addon_events=%u, compile_us=%llu).", static_cast<unsigned long long>(job.id), reshade::log::hr_to_string(hr).c_str(), handled_by_addon_events, static_cast<unsigned long long>(compile_us));
+				if constexpr (async_pipeline_debug_diagnostics)
+				{
+					if (job.stream_desc != nullptr)
+						log_pipeline_state_stream_desc(job.id, job.stream_desc->desc);
+					if (job.graphics_desc != nullptr)
+						log_graphics_pipeline_desc(job.id, job.graphics_desc->desc);
+					if (job.compute_desc != nullptr)
+						log_compute_pipeline_desc(job.id, job.compute_desc->desc);
+				}
 				job.proxy->set_compile_failed();
 			}
 			job.proxy->Release();
@@ -1829,6 +2351,8 @@ private:
 	D3D12Device *_device_proxy = nullptr;
 	ID3D12Device *_device = nullptr;
 	std::atomic<uint64_t> _next_proxy_id = 1;
+	std::mutex _dummy_root_signature_mutex;
+	com_ptr<ID3D12RootSignature> _dummy_root_signature;
 	std::mutex _fallback_mutex;
 	GraphicsFallbackKey _global_fallback_key = {};
 	bool _has_global_fallback_key = false;
@@ -1868,26 +2392,41 @@ void destroy_d3d12_async_pipeline_manager(D3D12AsyncPipelineManager *manager)
 
 D3D12AsyncPipelineManager *create_d3d12_async_pipeline_manager(D3D12Device *device_proxy, ID3D12Device *device)
 {
+	if constexpr (!async_pipeline_enabled)
+		return nullptr;
+
 	return new D3D12AsyncPipelineManager(device_proxy, device);
 }
 
 HRESULT create_async_graphics_pipeline_state(D3D12AsyncPipelineManager *manager, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **pipeline_state)
 {
+	if constexpr (!async_pipeline_enabled)
+		return E_FAIL;
+
 	return manager != nullptr ? manager->create_graphics_pipeline_state(desc, riid, pipeline_state) : E_FAIL;
 }
 
 HRESULT create_async_compute_pipeline_state(D3D12AsyncPipelineManager *manager, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **pipeline_state)
 {
+	if constexpr (!async_pipeline_enabled)
+		return E_FAIL;
+
 	return manager != nullptr ? manager->create_compute_pipeline_state(desc, riid, pipeline_state) : E_FAIL;
 }
 
 HRESULT create_async_pipeline_state_stream(D3D12AsyncPipelineManager *manager, const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **pipeline_state)
 {
+	if constexpr (!async_pipeline_enabled)
+		return E_FAIL;
+
 	return manager != nullptr ? manager->create_pipeline_state_stream(desc, riid, pipeline_state) : E_FAIL;
 }
 
 void note_async_pipeline_state_stream_create(REFIID riid)
 {
+	if constexpr (!async_pipeline_enabled)
+		return;
+
 	const uint64_t stream_create_count = g_async_pipeline_diagnostics.stream_create_calls.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (riid == __uuidof(ID3D12PipelineState1))
 		g_async_pipeline_diagnostics.stream_pipeline_state1_requests.fetch_add(1, std::memory_order_relaxed);
@@ -1897,16 +2436,25 @@ void note_async_pipeline_state_stream_create(REFIID riid)
 
 void note_async_pipeline_fallback_draw_skip()
 {
+	if constexpr (!async_pipeline_enabled)
+		return;
+
 	g_async_pipeline_diagnostics.fallback_draw_skips.fetch_add(1, std::memory_order_relaxed);
 }
 
 void note_async_pipeline_fallback_promotion()
 {
+	if constexpr (!async_pipeline_enabled)
+		return;
+
 	g_async_pipeline_diagnostics.fallback_promotions.fetch_add(1, std::memory_order_relaxed);
 }
 
 void note_async_pageable_make_resident(ID3D12Pageable *pageable)
 {
+	if constexpr (!async_pipeline_enabled)
+		return;
+
 	D3D12AsyncPipelineProxy *proxy = nullptr;
 	if (pageable != nullptr && SUCCEEDED(pageable->QueryInterface(__uuidof(D3D12AsyncPipelineProxy), reinterpret_cast<void **>(&proxy))))
 	{
@@ -1917,6 +2465,9 @@ void note_async_pageable_make_resident(ID3D12Pageable *pageable)
 
 void note_async_pageable_evict(ID3D12Pageable *pageable)
 {
+	if constexpr (!async_pipeline_enabled)
+		return;
+
 	D3D12AsyncPipelineProxy *proxy = nullptr;
 	if (pageable != nullptr && SUCCEEDED(pageable->QueryInterface(__uuidof(D3D12AsyncPipelineProxy), reinterpret_cast<void **>(&proxy))))
 	{
@@ -1927,6 +2478,9 @@ void note_async_pageable_evict(ID3D12Pageable *pageable)
 
 void note_async_pageable_residency_priority(ID3D12Pageable *pageable, D3D12_RESIDENCY_PRIORITY priority)
 {
+	if constexpr (!async_pipeline_enabled)
+		return;
+
 	D3D12AsyncPipelineProxy *proxy = nullptr;
 	if (pageable != nullptr && SUCCEEDED(pageable->QueryInterface(__uuidof(D3D12AsyncPipelineProxy), reinterpret_cast<void **>(&proxy))))
 	{
@@ -1937,6 +2491,9 @@ void note_async_pageable_residency_priority(ID3D12Pageable *pageable, D3D12_RESI
 
 D3D12AsyncPipelineProxy *get_async_pipeline_state_proxy(ID3D12PipelineState *pipeline_state)
 {
+	if constexpr (!async_pipeline_enabled)
+		return nullptr;
+
 	return pipeline_state != nullptr ? try_addref_async_pipeline_proxy(pipeline_state) : nullptr;
 }
 
@@ -1950,11 +2507,17 @@ ID3D12PipelineState *resolve_async_pipeline_state_proxy(D3D12AsyncPipelineProxy 
 {
 	if (resolved_to_fallback != nullptr)
 		*resolved_to_fallback = false;
+	if constexpr (!async_pipeline_enabled)
+		return nullptr;
+
 	return proxy != nullptr ? proxy->current_native_for_bind(resolved_to_fallback) : nullptr;
 }
 
 HRESULT store_async_pipeline_state_proxy_or_defer(D3D12AsyncPipelineProxy *proxy, ID3D12PipelineLibrary *library, LPCWSTR name)
 {
+	if constexpr (!async_pipeline_enabled)
+		return E_POINTER;
+
 	return proxy != nullptr ? proxy->store_or_defer(library, name) : E_POINTER;
 }
 
@@ -1970,6 +2533,8 @@ ID3D12PipelineState *resolve_async_pipeline_state(ID3D12PipelineState *pipeline_
 
 	if (pipeline_state == nullptr)
 		return nullptr;
+	if constexpr (!async_pipeline_enabled)
+		return pipeline_state;
 
 	D3D12AsyncPipelineProxy *const proxy = get_async_pipeline_state_proxy(pipeline_state);
 	if (proxy != nullptr)
@@ -1986,6 +2551,8 @@ ID3D12Pageable *resolve_async_pageable(ID3D12Pageable *pageable)
 {
 	if (pageable == nullptr)
 		return nullptr;
+	if constexpr (!async_pipeline_enabled)
+		return pageable;
 
 	D3D12AsyncPipelineProxy *proxy = nullptr;
 	if (SUCCEEDED(pageable->QueryInterface(__uuidof(D3D12AsyncPipelineProxy), reinterpret_cast<void **>(&proxy))))
