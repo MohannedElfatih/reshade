@@ -11,6 +11,7 @@
 class D3D10Device;
 class D3D11Device;
 class D3D12CommandQueue;
+class D3D12AsyncPipelineFramePacing;
 namespace reshade::api { enum class device_api; struct swapchain; }
 
 MIDL_INTERFACE("8C803E30-9E41-4DDF-B206-46F28E90E405") IDXGISwapChainTest : IUnknown
@@ -126,6 +127,7 @@ private:
 	reshade::api::swapchain *const _impl;
 	bool _is_initialized = false;
 	bool _was_still_drawing_last_frame = false;
+	D3D12AsyncPipelineFramePacing *_async_pipeline_frame_pacing = nullptr;
 
 #if RESHADE_ADDON
 public:

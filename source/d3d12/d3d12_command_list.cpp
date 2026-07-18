@@ -282,7 +282,7 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DrawInstanced(UINT VertexCountP
 	if (_async_pipeline_state_is_fallback)
 	{
 		try_promote_async_pipeline_state_from_fallback();
-		if (_async_pipeline_state_is_fallback)
+		if (_async_pipeline_state_is_fallback && should_skip_async_pipeline_fallback_commands())
 		{
 			// _orig->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
 			note_async_pipeline_fallback_draw_skip();
@@ -301,7 +301,7 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DrawIndexedInstanced(UINT Index
 	if (_async_pipeline_state_is_fallback)
 	{
 		try_promote_async_pipeline_state_from_fallback();
-		if (_async_pipeline_state_is_fallback)
+		if (_async_pipeline_state_is_fallback && should_skip_async_pipeline_fallback_commands())
 		{
 			// _orig->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 			note_async_pipeline_fallback_draw_skip();
@@ -320,7 +320,7 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::Dispatch(UINT ThreadGroupCountX
 	if (_async_pipeline_state_is_fallback)
 	{
 		try_promote_async_pipeline_state_from_fallback();
-		if (_async_pipeline_state_is_fallback)
+		if (_async_pipeline_state_is_fallback && should_skip_async_pipeline_fallback_commands())
 		{
 			// _orig->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
 			note_async_pipeline_fallback_draw_skip();
@@ -1030,7 +1030,7 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::ExecuteIndirect(ID3D12CommandSi
 	if (_async_pipeline_state_is_fallback)
 	{
 		try_promote_async_pipeline_state_from_fallback();
-		if (_async_pipeline_state_is_fallback)
+		if (_async_pipeline_state_is_fallback && should_skip_async_pipeline_fallback_commands())
 		{
 			// _orig->ExecuteIndirect(pCommandSignature, MaxCommandCount, pArgumentBuffer, ArgumentBufferOffset, pCountBuffer, CountBufferOffset);
 			note_async_pipeline_fallback_draw_skip();
@@ -1311,7 +1311,7 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DispatchMesh(UINT ThreadGroupCo
 	if (_async_pipeline_state_is_fallback)
 	{
 		try_promote_async_pipeline_state_from_fallback();
-		if (_async_pipeline_state_is_fallback)
+		if (_async_pipeline_state_is_fallback && should_skip_async_pipeline_fallback_commands())
 		{
 			// _orig->DispatchMesh(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
 			note_async_pipeline_fallback_draw_skip();

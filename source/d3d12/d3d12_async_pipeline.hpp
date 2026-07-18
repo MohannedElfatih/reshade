@@ -8,6 +8,7 @@
 #include <d3d12.h>
 
 class D3D12AsyncPipelineManager;
+class D3D12AsyncPipelineFramePacing;
 class D3D12AsyncPipelineProxy;
 class D3D12Device;
 
@@ -18,8 +19,12 @@ HRESULT create_async_graphics_pipeline_state(D3D12AsyncPipelineManager *manager,
 HRESULT create_async_compute_pipeline_state(D3D12AsyncPipelineManager *manager, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **pipeline_state);
 HRESULT create_async_pipeline_state_stream(D3D12AsyncPipelineManager *manager, const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **pipeline_state);
 void note_async_pipeline_state_stream_create(REFIID riid);
+D3D12AsyncPipelineFramePacing *create_async_pipeline_frame_pacing(D3D12AsyncPipelineManager *manager);
+void destroy_async_pipeline_frame_pacing(D3D12AsyncPipelineFramePacing *frame_pacing);
+void note_async_pipeline_frame_present(D3D12AsyncPipelineFramePacing *frame_pacing);
 void note_async_pipeline_fallback_draw_skip();
 void note_async_pipeline_fallback_promotion();
+bool should_skip_async_pipeline_fallback_commands();
 void note_async_pageable_make_resident(ID3D12Pageable *pageable);
 void note_async_pageable_evict(ID3D12Pageable *pageable);
 void note_async_pageable_residency_priority(ID3D12Pageable *pageable, D3D12_RESIDENCY_PRIORITY priority);

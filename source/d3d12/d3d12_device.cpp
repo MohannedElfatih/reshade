@@ -57,6 +57,11 @@ D3D12Device::~D3D12Device()
 	_orig->SetPrivateData(__uuidof(D3D12Device), 0, nullptr);
 }
 
+D3D12AsyncPipelineFramePacing *D3D12Device::create_async_pipeline_frame_pacing()
+{
+	return ::create_async_pipeline_frame_pacing(_async_pipeline_manager);
+}
+
 bool D3D12Device::check_and_upgrade_interface(REFIID riid)
 {
 	if (riid == __uuidof(this) ||
