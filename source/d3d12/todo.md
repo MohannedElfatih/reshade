@@ -8,11 +8,10 @@ Current architecture and release goals: [plan.md](plan.md). Chronological implem
   - Defer for now; revisit later once the current fallback/proxy path is more stable.
 - [x] Improve fallback compatibility keys to reduce mismatches without exploding cache size.
   - Defer for now; revisit later once we have a better view of which fields actually matter in practice.
-- [x] Add compile backpressure, queue limits, and worker budgeting.
-  - Expand this into: cap the number of queued compile jobs, limit concurrent worker threads, and throttle compilation when the game is under heavy load or during frame-time-sensitive periods.
+- [x] Add compile backpressure and worker budgeting.
+  - Expand this into: limit concurrent worker threads and throttle compilation when the game is under heavy load or during frame-time-sensitive periods.
   - The goal is to prevent a burst of async PSO work from creating new hitching spikes while still allowing the system to compile useful pipelines in the background.
   - Initial pacing compares a short D3D12 present-time average to a slowly learned baseline: only a material regression limits real PSO creation to one worker.
-  - `MaxQueuedJobs` defaults to `0` (unlimited). With a nonzero limit, a full queue forces synchronous creation for that request, avoiding permanently pending fallback proxies while bounding async memory and backlog.
 - [x] Replace fixed bind-count gating with a more adaptive real-PSO promotion strategy.
   - Remove the fixed bind-count approach entirely.
   - Instead, rely on more natural triggers such as: publish the real PSO once compilation has completed and the pipeline is likely to be used soon, or allow promotion based on broader runtime context rather than a magic bind threshold.

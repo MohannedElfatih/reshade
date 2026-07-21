@@ -26,11 +26,10 @@
 // ReShade.ini [ASYNC] settings:
 //   EnableMiniDump=0  Write an exception minidump beside ReShade.ini (handled in 'dll_main.cpp').
 //   Debug=0           Enable detailed async-PSO diagnostic logging.
-//   Sentinel=1        Use a shared sentinel fallback PSO; set to 0 for keyed fallback PSOs.
-//   FallbackMode=0    Skip pending draw/dispatch/indirect commands; set to 1 to execute fallback shaders.
-//   CompilePacing=1   Limit PSO compilation to one worker when the rolling frame time is high.
-//   MaxQueuedJobs=0   Bound pending real-PSO jobs; 0 disables the limit. A full queue creates synchronously.
-//   WaitForCachedBlob=1 Wait for the real PSO before returning cached pipeline data.
+//   Sentinel=1        Use a shared sentinel fallback PSO; set to 0 for keyed fallback PSOs (Unique fallbacks based on root signature, slower but could be more stable).
+//   FallbackMode=0    Skip pending draw/dispatch/indirect commands; set to 1 to execute fallback shaders (Slower but might be more stable).
+//   CompilePacing=1   Limit PSO compilation workers when the rolling frame time is high.
+//   WaitForCachedBlob=1 Wait for the real PSO before returning cached pipeline data (Should always be on, but can be disabled for testing).
 
 
 /* e.g:
@@ -40,7 +39,6 @@ Debug=0
 Sentinel=1
 FallbackMode=0
 CompilePacing=1
-MaxQueuedJobs=0
 WaitForCachedBlob=1
 */
 
@@ -62,7 +60,6 @@ struct AsyncPipelineDiagnostics
 	std::atomic<uint64_t> fallback_creation_failures = 0;
 	std::atomic<uint64_t> queued_jobs = 0;
 	std::atomic<uint64_t> queue_depth_high_watermark = 0;
-	std::atomic<uint64_t> queue_limit_sync_creates = 0;
 	std::atomic<uint64_t> async_compile_successes = 0;
 	std::atomic<uint64_t> async_compile_failures = 0;
 	std::atomic<uint64_t> async_compile_total_us = 0;
@@ -94,7 +91,6 @@ static bool use_global_sentinel_fallback_pso = true;
 static bool async_pipeline_debug_diagnostics = false;
 static bool async_pipeline_compile_pacing = true;
 static bool async_pipeline_wait_for_cached_blob = true;
-static unsigned int async_pipeline_max_queued_jobs = 0;
 static std::once_flag async_pipeline_config_once;
 static constexpr bool publish_fallback_pipelines_to_addons = false;
 static constexpr bool allow_addons_to_modify_fallback_pipelines = false;
@@ -125,7 +121,6 @@ static void load_async_pipeline_config()
 		reshade::global_config().get("ASYNC", "Sentinel", use_global_sentinel_fallback_pso);
 		async_pipeline_debug_diagnostics = reshade::global_config().get("ASYNC", "Debug");
 		reshade::global_config().get("ASYNC", "CompilePacing", async_pipeline_compile_pacing);
-		reshade::global_config().get("ASYNC", "MaxQueuedJobs", async_pipeline_max_queued_jobs);
 		reshade::global_config().get("ASYNC", "WaitForCachedBlob", async_pipeline_wait_for_cached_blob);
 	});
 }
@@ -205,7 +200,6 @@ static void log_async_pipeline_diagnostics(const char *reason)
 	log_async_pipeline_diagnostics_row("fallback_hits", g_async_pipeline_diagnostics.fallback_cache_hits.load(std::memory_order_relaxed), "fallback_misses", g_async_pipeline_diagnostics.fallback_cache_misses.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_row(use_global_sentinel_fallback_pso ? "sentinel_fallbacks" : "fallback_buckets", g_async_pipeline_diagnostics.fallback_buckets_created.load(std::memory_order_relaxed), "fallback_failures", g_async_pipeline_diagnostics.fallback_creation_failures.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_row("queued", g_async_pipeline_diagnostics.queued_jobs.load(std::memory_order_relaxed), "queue_hwm", g_async_pipeline_diagnostics.queue_depth_high_watermark.load(std::memory_order_relaxed));
-	log_async_pipeline_diagnostics_row("queue_limit_sync", g_async_pipeline_diagnostics.queue_limit_sync_creates.load(std::memory_order_relaxed), "queue_limit", async_pipeline_max_queued_jobs);
 	log_async_pipeline_diagnostics_row("compile_ok", compile_successes, "compile_fail", g_async_pipeline_diagnostics.async_compile_failures.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_timing_row("compile_avg_ms", compile_successes != 0 ? static_cast<double>(compile_total_us) / static_cast<double>(compile_successes) / 1000.0 : 0.0, "compile_max_ms", static_cast<double>(g_async_pipeline_diagnostics.async_compile_max_us.load(std::memory_order_relaxed)) / 1000.0);
 	log_async_pipeline_diagnostics_row("proxy_resolves", g_async_pipeline_diagnostics.proxy_resolves.load(std::memory_order_relaxed), "resolves_fallback", g_async_pipeline_diagnostics.proxy_resolves_to_fallback.load(std::memory_order_relaxed));
@@ -1496,7 +1490,7 @@ public:
 		assert(_device_proxy != nullptr);
 		assert(_device != nullptr);
 		_device->AddRef();
-		reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO enabled: sentinel=%u, fallback_mode=%s, compile_workers=%u/%u/%u (75/50/25%% of %u hardware threads), compile_pacing=%u, max_queued_jobs=%u, wait_for_cached_blob=%u, debug=%u.", use_global_sentinel_fallback_pso, get_async_pipeline_fallback_mode_name(), _compile_worker_count, _compile_worker_middle_count, _compile_worker_lower_count, _hardware_thread_count, async_pipeline_compile_pacing, async_pipeline_max_queued_jobs, async_pipeline_wait_for_cached_blob, async_pipeline_debug_diagnostics);
+		reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO enabled: sentinel=%u, fallback_mode=%s, compile_workers=%u/%u/%u (75/50/25%% of %u hardware threads), compile_pacing=%u, wait_for_cached_blob=%u, debug=%u.", use_global_sentinel_fallback_pso, get_async_pipeline_fallback_mode_name(), _compile_worker_count, _compile_worker_middle_count, _compile_worker_lower_count, _hardware_thread_count, async_pipeline_compile_pacing, async_pipeline_wait_for_cached_blob, async_pipeline_debug_diagnostics);
 		for (uint32_t i = 0; i < _compile_worker_count; ++i)
 			_workers.emplace_back([this]() { worker_loop(); });
 		_residency_worker = std::thread([this]() { residency_worker_loop(); });
@@ -1575,12 +1569,7 @@ public:
 		job.proxy = proxy;
 		job.graphics_desc = std::make_unique<CopiedGraphicsPipelineDesc>(working_desc);
 		job.id = id;
-		if (!enqueue_compile_job(std::move(job)))
-		{
-			proxy->Release();
-			increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.queue_limit_sync_creates, 1);
-			return _device->CreateGraphicsPipelineState(desc, riid, pipeline_state);
-		}
+		enqueue_compile_job(std::move(job));
 
 		increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.async_proxy_creates, 1);
 		*pipeline_state = proxy;
@@ -1635,12 +1624,7 @@ public:
 		job.proxy = proxy;
 		job.compute_desc = std::make_unique<CopiedComputePipelineDesc>(working_desc);
 		job.id = id;
-		if (!enqueue_compile_job(std::move(job)))
-		{
-			proxy->Release();
-			increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.queue_limit_sync_creates, 1);
-			return _device->CreateComputePipelineState(desc, riid, pipeline_state);
-		}
+		enqueue_compile_job(std::move(job));
 
 		increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.async_proxy_creates, 1);
 		*pipeline_state = proxy;
@@ -1715,12 +1699,7 @@ public:
 			job.proxy = proxy;
 			job.stream_desc = std::move(copied_stream_desc);
 			job.id = id;
-			if (!enqueue_compile_job(std::move(job)))
-			{
-				proxy->Release();
-				increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.queue_limit_sync_creates, 1);
-				goto sync_with_events;
-			}
+			enqueue_compile_job(std::move(job));
 
 			increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.async_proxy_creates, 1);
 			*pipeline_state = proxy;
@@ -1768,12 +1747,7 @@ public:
 			job.proxy = proxy;
 			job.stream_desc = std::move(copied_stream_desc);
 			job.id = id;
-			if (!enqueue_compile_job(std::move(job)))
-			{
-				proxy->Release();
-				increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.queue_limit_sync_creates, 1);
-				goto sync_with_events;
-			}
+			enqueue_compile_job(std::move(job));
 
 			increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.async_proxy_creates, 1);
 			*pipeline_state = proxy;
@@ -2582,14 +2556,11 @@ public:
 	}
 
 private:
-	bool enqueue_compile_job(CompileJob &&job)
+	void enqueue_compile_job(CompileJob &&job)
 	{
 		bool notify_worker = false;
 		{
 			std::lock_guard<std::mutex> lock(_queue_mutex);
-			if (async_pipeline_max_queued_jobs != 0 && _compile_queue.size() >= async_pipeline_max_queued_jobs)
-				return false;
-
 			_compile_queue.push_back(std::move(job));
 			notify_worker = _compile_queue.size() <= _compile_worker_count;
 			increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.queued_jobs, 1);
@@ -2599,7 +2570,6 @@ private:
 		}
 		if (notify_worker)
 			g_async_pipeline_compile_gate_cv.notify_one();
-		return true;
 	}
 
 	bool acquire_compile_worker_slot()
@@ -2758,14 +2728,6 @@ private:
 	{
 		const uint32_t previous_count = _pending_compile_jobs.fetch_sub(job_count, std::memory_order_relaxed);
 		assert(previous_count >= job_count);
-		const uint32_t remaining_count = previous_count - job_count;
-		if (async_pipeline_compile_pacing && remaining_count <= _compile_worker_count && _compile_worker_limit.load(std::memory_order_acquire) != _compile_worker_count)
-		{
-			std::lock_guard<std::mutex> lock(_frame_pacing_mutex);
-			const uint32_t current_pending_count = _pending_compile_jobs.load(std::memory_order_relaxed);
-			if (current_pending_count <= _compile_worker_count)
-				restore_full_compile_worker_limit_unlocked(current_pending_count, "pending PSOs fit available workers");
-		}
 	}
 
 	void release_compile_worker_slot()

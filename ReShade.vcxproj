@@ -792,6 +792,8 @@
     <None Include="res\shaders\imgui_ps_430.glsl" />
     <None Include="res\shaders\imgui_vs_430.glsl" />
     <None Include="res\shaders\mipmap_cs_430.glsl" />
+	<None Include="source\d3d12\d3d12_async_pipeline_fallback_ms.hlsl" />
+	<None Include="source\d3d12\d3d12_async_pipeline_fallback_ps.hlsl" />
     <None Include="res\version.rc2" />
     <None Include="tools\update_version.ps1" />
   </ItemGroup>
