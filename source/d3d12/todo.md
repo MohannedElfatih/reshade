@@ -32,6 +32,9 @@ Current architecture and release goals: [plan.md](plan.md). Chronological implem
 - [x] Wait for the real PSO when `GetCachedBlob` is called.
   - `[ASYNC] WaitForCachedBlob=1` is enabled by default. The calling thread sleeps until the normally queued real PSO finishes; the job is not reprioritized.
   - Compilation failure and manager shutdown wake waiters with a terminal failure instead of leaving them blocked.
+- [x] Prioritize queued PSOs that are bound while still pending.
+  - Pending bind and just-in-time promotion probes atomically transfer a job from `queued` to `priority_queued` and append a shared job node to a dedicated urgent queue. Workers claim urgent jobs before normal FIFO jobs, without scanning the full compile backlog.
+  - Normal FIFO workers only claim `queued` jobs; stale entries for `priority_queued`, `claimed`, or `finished` jobs are discarded. Compiler slots are acquired before dequeue so throttled workers cannot hide work from prioritization. `GetCachedBlob` does not affect bind priority.
 - [x] Make detailed diagnostics counters debug-only.
   - `[ASYNC] Debug=0` no longer performs global diagnostic atomic increments/max updates or unconditional per-proxy bind-count writes.
 - [x] Add a global mesh sentinel fallback.

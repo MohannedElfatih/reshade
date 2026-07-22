@@ -317,14 +317,14 @@ if(MSVC)
       /Zc:threadSafeInit-
       /utf-8
       /Zc:char8_t-
-      $<$<CONFIG:Release>:/Oi /GL /GF /GS- /Gy>
+      $<$<CONFIG:Release>:/Zi /Oi /GL /GF /GS- /Gy>
       /fp:fast
       $<$<CONFIG:Release>:/GR->
   )
   target_link_options(
     ReShade
     PRIVATE
-      $<$<CONFIG:Release>:/OPT:REF /OPT:NOICF /LTCG>
+      $<$<CONFIG:Release>:/DEBUG:FULL /OPT:REF /OPT:NOICF /LTCG>
   )
 else()
   target_compile_options(

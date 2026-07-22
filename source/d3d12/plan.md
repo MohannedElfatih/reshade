@@ -60,6 +60,7 @@ Proxy policy:
 The scheduler should prevent compiler work from becoming a new source of hitches.
 
 - Maintain a bounded configurable queue and report queue-limit fallbacks.
+- Transfer queued PSOs that resolve to a fallback into a dedicated urgent queue, which workers drain before normal FIFO work without scanning the full compile backlog.
 - Keep a worker pool, but begin with a conservative active compiler limit of one or two.
 - Increase concurrency only after sustained frame-time headroom.
 - Reduce concurrency immediately when present timing regresses.
