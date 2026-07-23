@@ -228,8 +228,10 @@ HRESULT STDMETHODCALLTYPE D3D12GraphicsCommandList::Reset(ID3D12CommandAllocator
 	if (SUCCEEDED(hr))
 	{
 		// Only invoke event if there actually is an initial state to bind, otherwise expect things were already handled by the 'reset_command_list' event above
+		// Fallback PSOs participate in the normal add-on pipeline lifecycle, so publish
+		// their native handle to keep add-on command-list state consistent.
 		if (initial_state != nullptr)
-			reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, initial_state_is_fallback ? reshade::api::pipeline {} : to_handle(initial_state));
+			reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, to_handle(initial_state));
 	}
 #endif
 
@@ -255,7 +257,7 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::ClearState(ID3D12PipelineState 
 	_previous_descriptor_heaps[1] = nullptr;
 
 	if (pipeline_state != nullptr)
-		reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, pipeline_state_is_fallback ? reshade::api::pipeline {} : to_handle(pipeline_state));
+		reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, to_handle(pipeline_state));
 
 	// When 'ClearState' is called, all currently bound resources are unbound.
 	// The primitive topology is set to D3D_PRIMITIVE_TOPOLOGY_UNDEFINED. Viewports, scissor rectangles, stencil reference value, and the blend factor are set to empty values (all zeros).
@@ -286,6 +288,9 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DrawInstanced(UINT VertexCountP
 		{
 			// _orig->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
 			note_async_pipeline_fallback_draw_skip();
+#if RESHADE_ADDON
+			reshade::invoke_addon_event<reshade::addon_event::draw>(this, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+#endif
 			return;
 		}
 	}
@@ -305,6 +310,9 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DrawIndexedInstanced(UINT Index
 		{
 			// _orig->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 			note_async_pipeline_fallback_draw_skip();
+#if RESHADE_ADDON
+			reshade::invoke_addon_event<reshade::addon_event::draw_indexed>(this, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+#endif
 			return;
 		}
 	}
@@ -324,6 +332,9 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::Dispatch(UINT ThreadGroupCountX
 		{
 			// _orig->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
 			note_async_pipeline_fallback_draw_skip();
+#if RESHADE_ADDON
+			reshade::invoke_addon_event<reshade::addon_event::dispatch>(this, ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+#endif
 			return;
 		}
 	}
@@ -550,7 +561,7 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::SetPipelineState(ID3D12Pipeline
 
 #if RESHADE_ADDON >= 2
 	if (pipeline_state != nullptr)
-		reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, pipeline_state_is_fallback ? reshade::api::pipeline {} : to_handle(pipeline_state));
+		reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, to_handle(pipeline_state));
 #endif
 }
 void STDMETHODCALLTYPE D3D12GraphicsCommandList::ResourceBarrier(UINT NumBarriers, const D3D12_RESOURCE_BARRIER *pBarriers)
@@ -1034,6 +1045,9 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::ExecuteIndirect(ID3D12CommandSi
 		{
 			// _orig->ExecuteIndirect(pCommandSignature, MaxCommandCount, pArgumentBuffer, ArgumentBufferOffset, pCountBuffer, CountBufferOffset);
 			note_async_pipeline_fallback_draw_skip();
+#if RESHADE_ADDON
+			reshade::invoke_addon_event<reshade::addon_event::draw_or_dispatch_indirect>(this, reshade::api::indirect_command::unknown, to_handle(pArgumentBuffer), ArgumentBufferOffset, MaxCommandCount, 0);
+#endif
 			return;
 		}
 	}
@@ -1315,12 +1329,15 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DispatchMesh(UINT ThreadGroupCo
 		{
 			// _orig->DispatchMesh(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
 			note_async_pipeline_fallback_draw_skip();
+#if RESHADE_ADDON
+			reshade::invoke_addon_event<reshade::addon_event::dispatch_mesh>(this, ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+#endif
 			return;
 		}
 	}
 
 #if RESHADE_ADDON
-	if (reshade::invoke_addon_event<reshade::addon_event::dispatch_mesh>(this, ThreadGroupCountX, ThreadGroupCountX, ThreadGroupCountZ))
+	if (reshade::invoke_addon_event<reshade::addon_event::dispatch_mesh>(this, ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ))
 		return;
 #endif
 

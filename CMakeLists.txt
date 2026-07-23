@@ -337,7 +337,7 @@ else()
   )
 endif()
 
-target_link_libraries(ReShade PRIVATE ReShadeFX D3D12On7 fpng glad ImGui jxl MinHook OpenVR OpenXR stb utfcpp VMA Windows d3dcompiler.lib)
+target_link_libraries(ReShade PRIVATE ReShadeFX D3D12On7 concurrentqueue fpng glad ImGui jxl MinHook OpenVR OpenXR parallel-hashmap stb utfcpp VMA Windows d3dcompiler.lib)
 
 # ReShade FX
 

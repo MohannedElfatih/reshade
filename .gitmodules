@@ -34,3 +34,9 @@
 	path = deps/jxl_simple_lossless
 	url = https://github.com/kampidh/simple-lossless-encoder.git
 	branch = headers-and-color-profile
+[submodule "deps/parallel-hashmap"]
+	path = deps/parallel-hashmap
+	url = https://github.com/greg7mdp/parallel-hashmap.git
+[submodule "deps/concurrentqueue"]
+	path = deps/concurrentqueue
+	url = https://github.com/cameron314/concurrentqueue.git

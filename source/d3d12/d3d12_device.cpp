@@ -359,8 +359,10 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreateCommandList(UINT nodeMask, D3D12_CO
 #endif
 
 #if RESHADE_ADDON >= 2
+				// Fallback PSOs participate in the normal add-on pipeline lifecycle, so publish
+				// their native handle to keep add-on command-list state consistent.
 				if (initial_state != nullptr)
-					reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(command_list_proxy, reshade::api::pipeline_stage::all, initial_state_is_fallback ? reshade::api::pipeline {} : to_handle(initial_state));
+					reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(command_list_proxy, reshade::api::pipeline_stage::all, to_handle(initial_state));
 #endif
 			}
 			else // Do not hook object if we do not support the requested interface

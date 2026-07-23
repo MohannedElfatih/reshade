@@ -274,6 +274,24 @@ target_compile_definitions(
     _CRT_SECURE_NO_WARNINGS
 )
 
+# parallel-hashmap
+
+add_library(parallel-hashmap INTERFACE)
+target_include_directories(
+  parallel-hashmap
+  INTERFACE
+    parallel-hashmap
+)
+
+# concurrentqueue
+
+add_library(concurrentqueue INTERFACE)
+target_include_directories(
+  concurrentqueue
+  INTERFACE
+    concurrentqueue
+)
+
 # utfcpp
 
 add_library(utfcpp INTERFACE)
