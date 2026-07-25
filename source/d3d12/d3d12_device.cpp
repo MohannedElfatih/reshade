@@ -57,11 +57,6 @@ D3D12Device::~D3D12Device()
 	_orig->SetPrivateData(__uuidof(D3D12Device), 0, nullptr);
 }
 
-D3D12AsyncPipelineFramePacing *D3D12Device::create_async_pipeline_frame_pacing()
-{
-	return ::create_async_pipeline_frame_pacing(_async_pipeline_manager);
-}
-
 bool D3D12Device::check_and_upgrade_interface(REFIID riid)
 {
 	if (riid == __uuidof(this) ||
@@ -359,9 +354,7 @@ HRESULT STDMETHODCALLTYPE D3D12Device::CreateCommandList(UINT nodeMask, D3D12_CO
 #endif
 
 #if RESHADE_ADDON >= 2
-				// Fallback PSOs participate in the normal add-on pipeline lifecycle, so publish
-				// their native handle to keep add-on command-list state consistent.
-				if (initial_state != nullptr)
+				if (initial_state != nullptr && !initial_state_is_fallback)
 					reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(command_list_proxy, reshade::api::pipeline_stage::all, to_handle(initial_state));
 #endif
 			}

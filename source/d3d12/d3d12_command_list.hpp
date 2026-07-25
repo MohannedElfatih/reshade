@@ -137,7 +137,6 @@ public:
 	void set_async_pipeline_state_is_fallback(bool value) { _async_pipeline_state_is_fallback = value; }
 	void set_async_pipeline_state_cache(ID3D12PipelineState *pipeline_state);
 	void reset_async_pipeline_state_cache();
-	bool try_promote_async_pipeline_state_from_fallback();
 
 	using command_list_impl::_orig;
 	LONG _ref = 1;

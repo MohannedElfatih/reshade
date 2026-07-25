@@ -29,29 +29,32 @@
 #include <vector>
 
 // ReShade.ini [ASYNC] settings:
-//   EnableMiniDump=0  Write an exception minidump beside ReShade.ini (handled in 'dll_main.cpp').
-//   Debug=0           Enable detailed async-PSO diagnostic logging.
-//   Sentinel=1        Use a shared sentinel fallback PSO; set to 0 for keyed fallback PSOs (Unique fallbacks based on root signature, slower but could be more stable).
-//   FallbackMode=0    Skip pending draw/dispatch/indirect commands; set to 1 to execute fallback shaders (Slower but might be more stable).
-//   CompilePacing=1   Limit PSO compilation workers when the rolling frame time is high.
-//   WaitForCachedBlob=1 Wait for the real PSO before returning cached pipeline data (Should always be on, but can be disabled for testing).
+//   EnableMiniDump=0		Write an exception minidump beside ReShade.ini (handled in 'dll_main.cpp').
+//   Debug=0				Enable detailed async-PSO diagnostic logging.
+//   Sentinel=1				Use a shared sentinel fallback PSO; set to 0 for keyed fallback PSOs (Unique fallbacks based on root signature, slower but could be more stable).
+//   FallbackMode=0			Pending fallback command behavior: 0 = skip all, 1 = allow all, 2 = skip non-dispatches, 3 = skip dispatches only.
+//   ComputeShaderBytecodeThreshold=0	Compile compute shaders at or below this size in KiB synchronously; set to 0 (default) to use the default of 10 KiB; only applies when SafeMode=1.
+//   SafeMode=1				Set to 1 to create rare geometry-producing PSOs (geometry/tessellation/stream-output/mesh) synchronously and enable ComputeShaderBytecodeThreshold logic.
+//   WaitForCachedBlob=1	Wait for the real PSO before returning cached pipeline data (Should always be on, but can be disabled for testing).
 
 
-/* e.g:
-[ASYNC]
-EnableMiniDump=0
-Debug=0
-Sentinel=1
-FallbackMode=0
-CompilePacing=1
-WaitForCachedBlob=1
-*/
+// e.g:
+//[ASYNC]
+//EnableMiniDump=0
+//Debug=0
+//Sentinel=1
+//FallbackMode=0
+//ComputeShaderBytecodeThreshold=0
+//SafeMode=1
+//WaitForCachedBlob=1
+//*/
 
 struct AsyncPipelineDiagnostics
 {
 	std::atomic<uint64_t> graphics_create_calls = 0;
 	std::atomic<uint64_t> graphics_pipeline_state1_requests = 0;
 	std::atomic<uint64_t> compute_create_calls = 0;
+	std::atomic<uint64_t> compute_shaders_over_threshold = 0;
 	std::atomic<uint64_t> compute_pipeline_state1_requests = 0;
 	std::atomic<uint64_t> stream_create_calls = 0;
 	std::atomic<uint64_t> stream_pipeline_state1_requests = 0;
@@ -66,7 +69,6 @@ struct AsyncPipelineDiagnostics
 	std::atomic<uint64_t> queued_jobs = 0;
 	std::atomic<uint64_t> queue_depth_high_watermark = 0;
 	std::atomic<uint64_t> stale_queue_entries = 0;
-	std::atomic<uint64_t> active_compile_workers_high_watermark = 0;
 	std::atomic<uint64_t> normal_jobs_selected = 0;
 	std::atomic<uint64_t> pending_proxy_binds = 0;
 	std::atomic<uint64_t> priority_jobs_selected = 0;
@@ -83,7 +85,6 @@ struct AsyncPipelineDiagnostics
 	std::atomic<uint64_t> get_cached_blob_wait_total_us = 0;
 	std::atomic<uint64_t> get_cached_blob_wait_max_us = 0;
 	std::atomic<uint64_t> fallback_draw_skips = 0;
-	std::atomic<uint64_t> fallback_promotions = 0;
 	std::atomic<uint64_t> deferred_store_queued = 0;
 	std::atomic<uint64_t> deferred_store_replayed = 0;
 };
@@ -93,8 +94,10 @@ static std::atomic<uint64_t> g_async_pipeline_deferred_store_failures = 0;
 
 enum class AsyncPipelineFallbackMode : unsigned int
 {
-	skip_commands = 0,
-	execute_fallback = 1,
+	skip_all = 0,
+	allow_all = 1,
+	skip_non_dispatches = 2,
+	skip_dispatches = 3,
 };
 
 enum class AsyncPipelineSentinelState : uint8_t
@@ -104,20 +107,19 @@ enum class AsyncPipelineSentinelState : uint8_t
 	ready
 };
 
-static AsyncPipelineFallbackMode async_pipeline_fallback_mode = AsyncPipelineFallbackMode::skip_commands;
+static AsyncPipelineFallbackMode async_pipeline_fallback_mode = AsyncPipelineFallbackMode::skip_all;
+static uint64_t async_compute_shader_bytecode_threshold = 10 * 1024;
 static bool use_global_sentinel_fallback_pso = true;
 static bool async_pipeline_debug_diagnostics = false;
-static bool async_pipeline_compile_pacing = true;
+static bool async_pipeline_safe_mode = true;
 static bool async_pipeline_wait_for_cached_blob = true;
 static std::once_flag async_pipeline_config_once;
 static constexpr bool publish_fallback_pipelines_to_addons = true;
 static constexpr bool allow_addons_to_modify_fallback_pipelines = false;
+static constexpr bool defer_async_pipeline_library_stores = true;
 static constexpr bool async_graphics_fallback_enabled = true;
 static constexpr bool async_compute_fallback_enabled = true;
 static constexpr unsigned int async_pipeline_compile_worker_thread_percentage = 75;
-static constexpr unsigned int async_pipeline_compile_lower_thread_percentage = 50;
-static constexpr uint64_t async_pipeline_pacing_control_interval_us = 250'000;
-static constexpr uint32_t async_pipeline_pacing_confirmation_samples = 2;
 static constexpr uint64_t async_pipeline_queue_operation_warning_threshold_us = 10'000;
 static constexpr uint64_t async_pipeline_log_interval = 512;
 static constexpr size_t async_pipeline_unordered_map_reserve = 20'000;
@@ -135,19 +137,45 @@ static constexpr bool async_pipeline_enabled = async_graphics_fallback_enabled |
 
 static const char *get_async_pipeline_fallback_mode_name()
 {
-	return async_pipeline_fallback_mode == AsyncPipelineFallbackMode::skip_commands ? "skip" : "execute";
+	switch (async_pipeline_fallback_mode)
+	{
+	case AsyncPipelineFallbackMode::skip_all:
+		return "skip_all";
+	case AsyncPipelineFallbackMode::allow_all:
+		return "allow_all";
+	case AsyncPipelineFallbackMode::skip_non_dispatches:
+		return "skip_non_dispatches";
+	case AsyncPipelineFallbackMode::skip_dispatches:
+		return "skip_dispatches";
+	default:
+		return "unknown";
+	}
 }
 
 static void load_async_pipeline_config()
 {
 	std::call_once(async_pipeline_config_once, []() {
-		unsigned int fallback_mode = static_cast<unsigned int>(AsyncPipelineFallbackMode::skip_commands);
+		unsigned int fallback_mode = static_cast<unsigned int>(AsyncPipelineFallbackMode::skip_all);
 		reshade::global_config().get("ASYNC", "FallbackMode", fallback_mode);
-		async_pipeline_fallback_mode = fallback_mode == static_cast<unsigned int>(AsyncPipelineFallbackMode::execute_fallback) ? AsyncPipelineFallbackMode::execute_fallback : AsyncPipelineFallbackMode::skip_commands;
+		async_pipeline_fallback_mode = fallback_mode <= static_cast<unsigned int>(AsyncPipelineFallbackMode::skip_dispatches) ? static_cast<AsyncPipelineFallbackMode>(fallback_mode) : AsyncPipelineFallbackMode::skip_all;
+
+		// SafeMode controls whether ComputeShaderBytecodeThreshold logic is active.
+		// If SafeMode=0, all compute shaders compile asynchronously (threshold disabled).
+		// If SafeMode=1, compute shaders at or below the threshold are compiled synchronously.
+		reshade::global_config().get("ASYNC", "SafeMode", async_pipeline_safe_mode);
+
+		unsigned int compute_shader_bytecode_threshold_kib = 10; // default value
+		bool has_threshold_key = reshade::global_config().get("ASYNC", "ComputeShaderBytecodeThreshold", compute_shader_bytecode_threshold_kib);
+		if (has_threshold_key && compute_shader_bytecode_threshold_kib == 0)
+			compute_shader_bytecode_threshold_kib = 10; // use default when explicitly set to 0
+		async_compute_shader_bytecode_threshold = static_cast<uint64_t>(compute_shader_bytecode_threshold_kib) * 1024;
+
+		// If SafeMode is disabled, override the threshold to disable it.
+		if (!async_pipeline_safe_mode)
+			async_compute_shader_bytecode_threshold = 0;
 
 		reshade::global_config().get("ASYNC", "Sentinel", use_global_sentinel_fallback_pso);
 		async_pipeline_debug_diagnostics = reshade::global_config().get("ASYNC", "Debug");
-		reshade::global_config().get("ASYNC", "CompilePacing", async_pipeline_compile_pacing);
 		reshade::global_config().get("ASYNC", "WaitForCachedBlob", async_pipeline_wait_for_cached_blob);
 	});
 }
@@ -209,12 +237,12 @@ static bool should_log_periodic(uint64_t count)
 {
 	if (!async_pipeline_debug_diagnostics)
 		return false;
-	return count != 0 && (count % async_pipeline_log_interval) == 0;
+	return count != 0 && (count <= 16 || (count % async_pipeline_log_interval) == 0);
 }
 
 static void log_async_pipeline_diagnostics_row(const char *name_a, uint64_t value_a, const char *name_b, uint64_t value_b)
 {
-	reshade::log::message(reshade::log::level::info, "[ASYNC]   | %-24s | %-16llu | %-24s | %-16llu |",
+	reshade::log::message(reshade::log::level::info, "          | %-24s | %-16llu | %-24s | %-16llu |",
 		name_a,
 		static_cast<unsigned long long>(value_a),
 		name_b,
@@ -223,14 +251,14 @@ static void log_async_pipeline_diagnostics_row(const char *name_a, uint64_t valu
 
 static void log_async_pipeline_diagnostics_row(const char *name, uint64_t value)
 {
-	reshade::log::message(reshade::log::level::info, "[ASYNC]   | %-24s | %-16llu |                          |                  |",
+	reshade::log::message(reshade::log::level::info, "          | %-24s | %-16llu |                          |                  |",
 		name,
 		static_cast<unsigned long long>(value));
 }
 
 static void log_async_pipeline_diagnostics_timing_row(const char *name_a, double value_a, const char *name_b, double value_b)
 {
-	reshade::log::message(reshade::log::level::info, "[ASYNC]   | %-24s | %-16.3f | %-24s | %-16.3f |", name_a, value_a, name_b, value_b);
+	reshade::log::message(reshade::log::level::info, "          | %-24s | %-16.3f | %-24s | %-16.3f |", name_a, value_a, name_b, value_b);
 }
 
 static void log_async_pipeline_diagnostics(const char *reason)
@@ -238,9 +266,9 @@ static void log_async_pipeline_diagnostics(const char *reason)
 	const uint64_t compile_successes = g_async_pipeline_diagnostics.async_compile_successes.load(std::memory_order_relaxed);
 	const uint64_t compile_total_us = g_async_pipeline_diagnostics.async_compile_total_us.load(std::memory_order_relaxed);
 	reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO %s diagnostics (sentinel=%u, fallback_mode=%s):", reason, use_global_sentinel_fallback_pso, get_async_pipeline_fallback_mode_name());
-	reshade::log::message(reshade::log::level::info, "[ASYNC]   +--------------------------+------------------+--------------------------+------------------+");
-	reshade::log::message(reshade::log::level::info, "[ASYNC]   | Counter                  | Value            | Counter                  | Value            |");
-	reshade::log::message(reshade::log::level::info, "[ASYNC]   +--------------------------+------------------+--------------------------+------------------+");
+	reshade::log::message(reshade::log::level::info, "          +--------------------------+------------------+--------------------------+------------------+");
+	reshade::log::message(reshade::log::level::info, "          | Counter                  | Value            | Counter                  | Value            |");
+	reshade::log::message(reshade::log::level::info, "          +--------------------------+------------------+--------------------------+------------------+");
 	log_async_pipeline_diagnostics_row("graphics_create", g_async_pipeline_diagnostics.graphics_create_calls.load(std::memory_order_relaxed), "graphics_iid1", g_async_pipeline_diagnostics.graphics_pipeline_state1_requests.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_row("compute_create", g_async_pipeline_diagnostics.compute_create_calls.load(std::memory_order_relaxed), "compute_iid1", g_async_pipeline_diagnostics.compute_pipeline_state1_requests.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_row("stream_create", g_async_pipeline_diagnostics.stream_create_calls.load(std::memory_order_relaxed), "stream_iid1", g_async_pipeline_diagnostics.stream_pipeline_state1_requests.load(std::memory_order_relaxed));
@@ -249,7 +277,7 @@ static void log_async_pipeline_diagnostics(const char *reason)
 	log_async_pipeline_diagnostics_row("fallback_hits", g_async_pipeline_diagnostics.fallback_cache_hits.load(std::memory_order_relaxed), "fallback_misses", g_async_pipeline_diagnostics.fallback_cache_misses.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_row(use_global_sentinel_fallback_pso ? "sentinel_fallbacks" : "fallback_buckets", g_async_pipeline_diagnostics.fallback_buckets_created.load(std::memory_order_relaxed), "fallback_failures", g_async_pipeline_diagnostics.fallback_creation_failures.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_row("queued", g_async_pipeline_diagnostics.queued_jobs.load(std::memory_order_relaxed), "queue_hwm", g_async_pipeline_diagnostics.queue_depth_high_watermark.load(std::memory_order_relaxed));
-	log_async_pipeline_diagnostics_row("stale_queue_entries", g_async_pipeline_diagnostics.stale_queue_entries.load(std::memory_order_relaxed), "active_workers_hwm", g_async_pipeline_diagnostics.active_compile_workers_high_watermark.load(std::memory_order_relaxed));
+	log_async_pipeline_diagnostics_row("stale_queue_entries", g_async_pipeline_diagnostics.stale_queue_entries.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_row("normal_selected", g_async_pipeline_diagnostics.normal_jobs_selected.load(std::memory_order_relaxed), "priority_selected", g_async_pipeline_diagnostics.priority_jobs_selected.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_row("pending_binds", g_async_pipeline_diagnostics.pending_proxy_binds.load(std::memory_order_relaxed), "compile_ok", compile_successes);
 	log_async_pipeline_diagnostics_row("compile_fail", g_async_pipeline_diagnostics.async_compile_failures.load(std::memory_order_relaxed), "proxy_resolves", g_async_pipeline_diagnostics.proxy_resolves.load(std::memory_order_relaxed));
@@ -260,9 +288,9 @@ static void log_async_pipeline_diagnostics(const char *reason)
 	const uint64_t cached_blob_wait_total_us = g_async_pipeline_diagnostics.get_cached_blob_wait_total_us.load(std::memory_order_relaxed);
 	log_async_pipeline_diagnostics_row("cached_blob_waits", cached_blob_waits, "fallback_draw_skips", g_async_pipeline_diagnostics.fallback_draw_skips.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_timing_row("cached_wait_avg_ms", cached_blob_waits != 0 ? static_cast<double>(cached_blob_wait_total_us) / static_cast<double>(cached_blob_waits) / 1000.0 : 0.0, "cached_wait_max_ms", static_cast<double>(g_async_pipeline_diagnostics.get_cached_blob_wait_max_us.load(std::memory_order_relaxed)) / 1000.0);
-	log_async_pipeline_diagnostics_row("fallback_promote", g_async_pipeline_diagnostics.fallback_promotions.load(std::memory_order_relaxed), "store_deferred", g_async_pipeline_diagnostics.deferred_store_queued.load(std::memory_order_relaxed));
+	log_async_pipeline_diagnostics_row("store_deferred", g_async_pipeline_diagnostics.deferred_store_queued.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_row("store_replayed", g_async_pipeline_diagnostics.deferred_store_replayed.load(std::memory_order_relaxed));
-	reshade::log::message(reshade::log::level::info, "[ASYNC]   +--------------------------+------------------+--------------------------+------------------+");
+	reshade::log::message(reshade::log::level::info, "          +--------------------------+------------------+--------------------------+------------------+");
 }
 
 static void note_async_pipeline_unsupported_desc(const char *reason)
@@ -516,7 +544,9 @@ public:
 	HRESULT store_or_defer(ID3D12PipelineLibrary *library, LPCWSTR name)
 	{
 		if (library == nullptr)
-			return E_POINTER;
+			return E_INVALIDARG;
+		if constexpr (!defer_async_pipeline_library_stores)
+			return library->StorePipeline(name, current_native());
 
 		if (ID3D12PipelineState *const real = real_for_store_addref())
 		{
@@ -543,7 +573,7 @@ public:
 		}
 
 		increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.deferred_store_queued, 1);
-		return S_OK;
+		return E_INVALIDARG;
 	}
 	ID3D12PipelineState *current_native_for_bind(bool *resolved_to_fallback = nullptr)
 	{
@@ -1596,14 +1626,6 @@ static bool convert_pipeline_state_stream_to_compute_desc(const D3D12_PIPELINE_S
 	return true;
 }
 
-struct D3D12FramePacingPublication
-{
-	uint64_t id = 0;
-	std::atomic<uint64_t> latest_present_us = 0;
-	std::atomic<uint64_t> present_count = 0;
-	std::atomic_bool update_pending = false;
-};
-
 class D3D12AsyncPipelineManager final
 {
 public:
@@ -1645,11 +1667,9 @@ public:
 		reshade::log::message(reshade::log::level::info, "[ASYNC] D3D12 validation capture: %s.",
 			_info_queue1 != nullptr ? "message callback active" : (_info_queue != nullptr ? "legacy info queue active" : "unavailable (D3D12 debug layer is not enabled)"));
 		_device->AddRef();
-		reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO enabled: sentinel=%u, fallback_mode=%s, compile_workers=%u/%u/%u (full/middle/lower from %u hardware threads), compile_pacing=%u, wait_for_cached_blob=%u, debug=%u.", use_global_sentinel_fallback_pso, get_async_pipeline_fallback_mode_name(), _compile_worker_count, _compile_worker_middle_count, _compile_worker_lower_count, _hardware_thread_count, async_pipeline_compile_pacing, async_pipeline_wait_for_cached_blob, async_pipeline_debug_diagnostics);
+		reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO enabled: sentinel=%u, fallback_mode=%s, compile_workers=%u (%u%% of %u hardware threads), wait_for_cached_blob=%u, debug=%u.", use_global_sentinel_fallback_pso, get_async_pipeline_fallback_mode_name(), _compile_worker_count, async_pipeline_compile_worker_thread_percentage, _hardware_thread_count, async_pipeline_wait_for_cached_blob, async_pipeline_debug_diagnostics);
 		for (uint32_t i = 0; i < _compile_worker_count; ++i)
 			_workers.emplace_back([this]() { worker_loop(); });
-		if (async_pipeline_compile_pacing)
-			_frame_pacing_worker = std::thread([this]() { frame_pacing_worker_loop(); });
 		_residency_worker = std::thread([this]() { residency_worker_loop(); });
 	}
 	~D3D12AsyncPipelineManager()
@@ -1659,16 +1679,11 @@ public:
 			_stop = true;
 		}
 		_compile_work_semaphore.signal(static_cast<int>(_compile_worker_count));
-		_frame_pacing_semaphore.signal();
-		_compile_slot_cv.notify_all();
 		for (std::thread &worker : _workers)
 			if (worker.joinable())
 				worker.join();
 
 		cancel_queued_compile_jobs();
-		if (_frame_pacing_worker.joinable())
-			_frame_pacing_worker.join();
-
 		if (_info_queue1 != nullptr)
 			_info_queue1->UnregisterMessageCallback(_info_queue_callback_cookie);
 
@@ -1712,6 +1727,11 @@ public:
 
 		const char *unsupported_reason = "none";
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC working_desc = *desc;
+		if (requires_safe_mode_synchronous_creation(working_desc, false, unsupported_reason))
+		{
+			note_async_pipeline_unsupported_desc(unsupported_reason);
+			return _device->CreateGraphicsPipelineState(desc, riid, pipeline_state);
+		}
 		if (!is_supported(working_desc, unsupported_reason, true, use_global_sentinel_fallback_pso))
 		{
 			note_async_pipeline_unsupported_desc(unsupported_reason);
@@ -1764,6 +1784,15 @@ public:
 			note_async_pipeline_unsupported_desc("compute async fallback disabled");
 			return _device->CreateComputePipelineState(desc, riid, pipeline_state);
 		}
+		if (async_compute_shader_bytecode_threshold != 0 && desc->CS.BytecodeLength <= async_compute_shader_bytecode_threshold)
+		{
+			reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO: compute shader bytecode size=%zu bytes is below threshold=%llu bytes.", desc->CS.BytecodeLength, static_cast<unsigned long long>(async_compute_shader_bytecode_threshold));
+			note_async_pipeline_unsupported_desc("compute shader bytecode not over async threshold");
+			return _device->CreateComputePipelineState(desc, riid, pipeline_state);
+		}
+		const uint64_t compute_shaders_over_threshold = increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.compute_shaders_over_threshold, 1);
+		if (should_log_periodic(compute_shaders_over_threshold))
+			reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO: compute shaders over bytecode threshold=%llu.", static_cast<unsigned long long>(compute_shaders_over_threshold));
 
 		const char *unsupported_reason = "none";
 		D3D12_COMPUTE_PIPELINE_STATE_DESC working_desc = *desc;
@@ -1830,6 +1859,11 @@ public:
 				note_async_pipeline_unsupported_desc("graphics stream async fallback disabled");
 				goto sync_with_events;
 			}
+			if (requires_safe_mode_synchronous_creation(graphics_desc, graphics_has_mesh_shader, graphics_unsupported_reason))
+			{
+				note_async_pipeline_unsupported_desc(graphics_unsupported_reason);
+				goto sync_with_events;
+			}
 			if (graphics_has_cached_pso)
 			{
 				note_async_pipeline_unsupported_desc("graphics stream uses cached PSO / pipeline library");
@@ -1878,6 +1912,15 @@ public:
 				note_async_pipeline_unsupported_desc("compute stream async fallback disabled");
 				goto sync_with_events;
 			}
+			if (async_compute_shader_bytecode_threshold != 0 && compute_desc.CS.BytecodeLength <= async_compute_shader_bytecode_threshold)
+			{
+				reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO: compute stream shader bytecode size=%zu bytes is below threshold=%llu bytes.", compute_desc.CS.BytecodeLength, static_cast<unsigned long long>(async_compute_shader_bytecode_threshold));
+				note_async_pipeline_unsupported_desc("compute stream shader bytecode not over async threshold");
+				goto sync_with_events;
+			}
+			const uint64_t compute_shaders_over_threshold = increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.compute_shaders_over_threshold, 1);
+			if (should_log_periodic(compute_shaders_over_threshold))
+				reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO: compute shaders over bytecode threshold=%llu.", static_cast<unsigned long long>(compute_shaders_over_threshold));
 			if (compute_has_cached_pso)
 			{
 				note_async_pipeline_unsupported_desc("compute stream uses cached PSO / pipeline library");
@@ -1960,19 +2003,6 @@ private:
 		std::atomic<State> state { State::queued };
 	};
 	using CompileJobPtr = std::shared_ptr<CompileJob>;
-	struct FramePacingSourceState
-	{
-		std::shared_ptr<D3D12FramePacingPublication> publication;
-		uint32_t requested_worker_limit = 0;
-		uint32_t candidate_worker_limit = 0;
-		uint32_t candidate_samples = 0;
-		uint64_t last_present_us = 0;
-		uint64_t last_present_count = 0;
-		uint64_t last_control_update_us = 0;
-		uint64_t recent_frame_us = 0;
-		uint64_t baseline_frame_us = 0;
-	};
-
 	static bool is_supported(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, const char *&unsupported_reason, bool allow_stream_output = false, bool allow_null_root_signature = false)
 	{
 		unsupported_reason = "none";
@@ -2007,6 +2037,35 @@ private:
 			return false;
 		}
 		return true;
+	}
+
+	static bool requires_safe_mode_synchronous_creation(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, bool has_mesh_shader, const char *&reason)
+	{
+		if (!async_pipeline_safe_mode)
+			return false;
+
+		if (has_mesh_shader)
+		{
+			reason = "safe mode synchronizes mesh pipeline";
+			return true;
+		}
+		if (desc.GS.pShaderBytecode != nullptr && desc.GS.BytecodeLength != 0)
+		{
+			reason = "safe mode synchronizes geometry-shader pipeline";
+			return true;
+		}
+		if ((desc.HS.pShaderBytecode != nullptr && desc.HS.BytecodeLength != 0) ||
+			(desc.DS.pShaderBytecode != nullptr && desc.DS.BytecodeLength != 0))
+		{
+			reason = "safe mode synchronizes tessellation pipeline";
+			return true;
+		}
+		if (desc.StreamOutput.NumEntries != 0 || desc.StreamOutput.NumStrides != 0)
+		{
+			reason = "safe mode synchronizes stream-output pipeline";
+			return true;
+		}
+		return false;
 	}
 
 	static bool is_supported(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, const char *&unsupported_reason, bool allow_null_root_signature = false)
@@ -2685,10 +2744,6 @@ private:
 			if (_stop.load(std::memory_order_acquire))
 				return;
 
-			// Keep work visible in the priority queue until a compiler slot is available.
-			if (!acquire_compile_worker_slot())
-				continue;
-
 			CompileJobPtr job;
 			bool selected_priority_job = false;
 			CompileJobPtr candidate;
@@ -2745,7 +2800,6 @@ private:
 			if (job == nullptr)
 			{
 				increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.stale_queue_entries, 1);
-				release_compile_worker_slot();
 				continue;
 			}
 			if (selected_priority_job)
@@ -2797,7 +2851,6 @@ private:
 			}
 			const auto compile_end = std::chrono::steady_clock::now();
 			g_async_pipeline_callback_job_id = 0;
-			release_compile_worker_slot();
 			const uint64_t compile_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(compile_end - compile_start).count());
 			update_atomic_max(g_async_pipeline_diagnostics.async_compile_max_us, compile_us);
 			if (SUCCEEDED(hr))
@@ -2877,7 +2930,7 @@ public:
 		{
 			job->state.store(CompileJob::State::queued, std::memory_order_release);
 			return false;
-		}
+	}
 		job->state.store(CompileJob::State::priority_queued, std::memory_order_release);
 		_compile_work_semaphore.signal();
 		return true;
@@ -2963,7 +3016,7 @@ private:
 			return;
 		}
 
-		queued_job->proxy->AddRef(); // Scheduler owns a reference until compilation finishes or is cancelled.
+		queued_job->proxy->AddRef();
 		const uint32_t pending_jobs = _pending_compile_jobs.fetch_add(1, std::memory_order_relaxed) + 1;
 		const bool inserted = _compile_jobs.try_emplace(queued_job->id, queued_job).second;
 		assert(inserted);
@@ -3033,220 +3086,10 @@ private:
 		assert(_compile_jobs.empty());
 	}
 
-	bool acquire_compile_worker_slot()
-	{
-		std::unique_lock<std::mutex> lock(_compile_slot_mutex);
-		_compile_slot_cv.wait(lock, [this]() {
-			const uint32_t worker_limit = _compile_worker_limit.load(std::memory_order_acquire);
-			return _stop.load(std::memory_order_acquire) || _active_compile_workers < worker_limit;
-		});
-		if (_stop.load(std::memory_order_acquire))
-			return false;
-		++_active_compile_workers;
-		update_atomic_max(g_async_pipeline_diagnostics.active_compile_workers_high_watermark, _active_compile_workers);
-		const uint32_t worker_limit = _compile_worker_limit.load(std::memory_order_acquire);
-		const bool wake_next_worker = _active_compile_workers < worker_limit;
-		lock.unlock();
-		if (wake_next_worker)
-			_compile_slot_cv.notify_one();
-		return true;
-	}
-
-public:
-	std::shared_ptr<D3D12FramePacingPublication> register_frame_pacing_source()
-	{
-		if (!async_pipeline_compile_pacing)
-			return nullptr;
-		auto publication = std::make_shared<D3D12FramePacingPublication>();
-		publication->id = _next_frame_pacing_source_id.fetch_add(1, std::memory_order_relaxed);
-		std::lock_guard<std::mutex> lock(_frame_pacing_mutex);
-		_frame_pacing_sources.emplace(publication->id, FramePacingSourceState { publication, _compile_worker_count, _compile_worker_count });
-		return publication;
-	}
-
-	void unregister_frame_pacing_source(const std::shared_ptr<D3D12FramePacingPublication> &publication)
-	{
-		if (publication == nullptr)
-			return;
-
-		std::lock_guard<std::mutex> lock(_frame_pacing_mutex);
-		_frame_pacing_sources.erase(publication->id);
-		const uint32_t aggregate_limit = get_aggregate_frame_pacing_limit_unlocked();
-		apply_compile_worker_limit_unlocked(aggregate_limit, _last_recent_frame_us.load(std::memory_order_relaxed), _last_baseline_frame_us.load(std::memory_order_relaxed), _pending_compile_jobs.load(std::memory_order_relaxed), "pacing source removed");
-	}
-
-	void note_frame_pacing_present(const std::shared_ptr<D3D12FramePacingPublication> &publication)
-	{
-		if (publication == nullptr || _stop.load(std::memory_order_acquire))
-			return;
-		const uint64_t now_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-		publication->latest_present_us.store(now_us, std::memory_order_relaxed);
-		publication->present_count.fetch_add(1, std::memory_order_release);
-		if (!publication->update_pending.exchange(true, std::memory_order_acq_rel))
-			_frame_pacing_semaphore.signal();
-	}
-
-	void frame_pacing_worker_loop()
-	{
-		for (;;)
-		{
-			_frame_pacing_semaphore.wait();
-			if (_stop.load(std::memory_order_acquire))
-				return;
-
-			std::lock_guard<std::mutex> lock(_frame_pacing_mutex);
-			for (auto &[source_id, state] : _frame_pacing_sources)
-			{
-				if (!state.publication->update_pending.exchange(false, std::memory_order_acq_rel))
-					continue;
-				const uint64_t present_count = state.publication->present_count.load(std::memory_order_acquire);
-				const uint64_t present_us = state.publication->latest_present_us.load(std::memory_order_relaxed);
-				process_frame_pacing_sample_unlocked(state, present_us, present_count);
-			}
-		}
-	}
-
-private:
-	void process_frame_pacing_sample_unlocked(FramePacingSourceState &state, uint64_t present_us, uint64_t present_count)
-	{
-		const uint64_t previous_us = state.last_present_us;
-		const uint64_t previous_count = state.last_present_count;
-		state.last_present_us = present_us;
-		state.last_present_count = present_count;
-		if (previous_us == 0 || present_us <= previous_us || present_count == previous_count)
-			return;
-
-		const uint64_t elapsed_us = present_us - previous_us;
-		const uint64_t elapsed_frames = present_count - previous_count;
-		const uint64_t frame_us = elapsed_us / elapsed_frames;
-		if (elapsed_us > 1'000'000)
-		{
-			state.requested_worker_limit = _compile_worker_count;
-			state.candidate_worker_limit = _compile_worker_count;
-			state.candidate_samples = 0;
-			state.recent_frame_us = 0;
-			state.baseline_frame_us = 0;
-			state.last_control_update_us = present_us;
-			apply_compile_worker_limit_unlocked(get_aggregate_frame_pacing_limit_unlocked(), _last_recent_frame_us.load(std::memory_order_relaxed), _last_baseline_frame_us.load(std::memory_order_relaxed), _pending_compile_jobs.load(std::memory_order_relaxed), "pacing source reset");
-			return;
-		}
-
-		state.recent_frame_us = state.recent_frame_us == 0 ? frame_us : (state.recent_frame_us * 7 + frame_us) / 8;
-		// Learn improvements quickly, but adapt upward slowly so a hitch does not become the new normal.
-		state.baseline_frame_us = state.baseline_frame_us == 0 ? frame_us : frame_us < state.baseline_frame_us ? (state.baseline_frame_us * 7 + frame_us) / 8 : (state.baseline_frame_us * 63 + frame_us) / 64;
-		if (state.last_control_update_us != 0 && present_us - state.last_control_update_us < async_pipeline_pacing_control_interval_us)
-			return;
-		state.last_control_update_us = present_us;
-
-		const uint64_t recent_frame_us = state.recent_frame_us;
-		const uint64_t baseline_frame_us = state.baseline_frame_us;
-
-		_last_recent_frame_us.store(recent_frame_us, std::memory_order_relaxed);
-		_last_baseline_frame_us.store(baseline_frame_us, std::memory_order_relaxed);
-		const uint32_t pending_compile_jobs = _pending_compile_jobs.load(std::memory_order_relaxed);
-		if (pending_compile_jobs <= _compile_worker_count)
-		{
-			restore_full_compile_worker_limit_unlocked(pending_compile_jobs, "pending PSOs fit available workers");
-			return;
-		}
-
-		const uint32_t desired_limit = calculate_frame_pacing_limit(recent_frame_us, baseline_frame_us);
-		if (desired_limit == state.requested_worker_limit)
-		{
-			state.candidate_worker_limit = desired_limit;
-			state.candidate_samples = 0;
-			return;
-		}
-
-		if (state.candidate_worker_limit != desired_limit)
-		{
-			state.candidate_worker_limit = desired_limit;
-			state.candidate_samples = 1;
-			return;
-		}
-		if (++state.candidate_samples < async_pipeline_pacing_confirmation_samples)
-			return;
-
-		state.requested_worker_limit = next_compile_worker_tier(state.requested_worker_limit, desired_limit);
-		state.candidate_worker_limit = state.requested_worker_limit;
-		state.candidate_samples = 0;
-		apply_compile_worker_limit_unlocked(get_aggregate_frame_pacing_limit_unlocked(), recent_frame_us, baseline_frame_us, pending_compile_jobs, "frame pacing");
-	}
-
-	uint32_t calculate_frame_pacing_limit(uint64_t recent_frame_us, uint64_t baseline_frame_us) const
-	{
-		const uint64_t proportional_limit = std::clamp<uint64_t>((static_cast<uint64_t>(_compile_worker_count) * baseline_frame_us + recent_frame_us / 2) / recent_frame_us, _compile_worker_lower_count, _compile_worker_count);
-		uint32_t desired_limit = _compile_worker_count;
-		uint64_t best_distance = proportional_limit > desired_limit ? proportional_limit - desired_limit : desired_limit - proportional_limit;
-		const uint64_t middle_distance = proportional_limit > _compile_worker_middle_count ? proportional_limit - _compile_worker_middle_count : _compile_worker_middle_count - proportional_limit;
-		if (middle_distance < best_distance)
-		{
-			desired_limit = _compile_worker_middle_count;
-			best_distance = middle_distance;
-		}
-		const uint64_t lower_distance = proportional_limit > _compile_worker_lower_count ? proportional_limit - _compile_worker_lower_count : _compile_worker_lower_count - proportional_limit;
-		if (lower_distance < best_distance)
-			desired_limit = _compile_worker_lower_count;
-		return desired_limit;
-	}
-
-	uint32_t next_compile_worker_tier(uint32_t current_limit, uint32_t desired_limit) const
-	{
-		if (desired_limit < current_limit)
-			return current_limit > _compile_worker_middle_count ? _compile_worker_middle_count : _compile_worker_lower_count;
-		if (desired_limit > current_limit)
-			return current_limit < _compile_worker_middle_count ? _compile_worker_middle_count : _compile_worker_count;
-		return current_limit;
-	}
-
-	uint32_t get_aggregate_frame_pacing_limit_unlocked() const
-	{
-		uint32_t limit = _compile_worker_count;
-		for (const auto &[source, state] : _frame_pacing_sources)
-			limit = std::min(limit, state.requested_worker_limit);
-		return limit;
-	}
-
-	void restore_full_compile_worker_limit_unlocked(uint32_t pending_compile_jobs, const char *reason)
-	{
-		for (auto &[source, state] : _frame_pacing_sources)
-		{
-			state.requested_worker_limit = _compile_worker_count;
-			state.candidate_worker_limit = _compile_worker_count;
-			state.candidate_samples = 0;
-		}
-		apply_compile_worker_limit_unlocked(_compile_worker_count, _last_recent_frame_us.load(std::memory_order_relaxed), _last_baseline_frame_us.load(std::memory_order_relaxed), pending_compile_jobs, reason);
-	}
-
-	void apply_compile_worker_limit_unlocked(uint32_t new_limit, uint64_t recent_frame_us, uint64_t baseline_frame_us, uint32_t pending_compile_jobs, const char *reason)
-	{
-		const uint32_t old_limit = _compile_worker_limit.exchange(new_limit, std::memory_order_acq_rel);
-		if (new_limit == old_limit)
-			return;
-
-		const bool reducing = new_limit < old_limit;
-		const reshade::log::level log_level = reducing ? reshade::log::level::warning : reshade::log::level::info;
-		const char *const transition = reducing ? (old_limit == _compile_worker_count ? "detected" : "intensified") : (new_limit == _compile_worker_count ? "cleared" : "eased");
-		reshade::log::message(log_level,
-			"[ASYNC] Async D3D12 PSO frame congestion %s (%s): recent=%.3f ms, baseline=%.3f ms, pending_psos=%u, worker_limit=%u->%u (tiers=%u/%u/%u).",
-			transition, reason, static_cast<double>(recent_frame_us) / 1000.0, static_cast<double>(baseline_frame_us) / 1000.0, pending_compile_jobs, old_limit, new_limit, _compile_worker_count, _compile_worker_middle_count, _compile_worker_lower_count);
-		if (new_limit > old_limit)
-			_compile_slot_cv.notify_one();
-	}
-
 	void finish_pending_compile_jobs(uint32_t job_count)
 	{
 		const uint32_t previous_count = _pending_compile_jobs.fetch_sub(job_count, std::memory_order_relaxed);
 		assert(previous_count >= job_count);
-	}
-
-	void release_compile_worker_slot()
-	{
-		{
-			std::lock_guard<std::mutex> lock(_compile_slot_mutex);
-			--_active_compile_workers;
-		}
-		_compile_slot_cv.notify_one();
 	}
 
 	D3D12Device *_device_proxy = nullptr;
@@ -3276,50 +3119,14 @@ private:
 	AsyncPipelineParallelNodeMap<uint64_t, CompileJobPtr> _compile_jobs;
 	std::atomic_bool _stop = false;
 	std::atomic<uint32_t> _pending_compile_jobs = 0;
-	std::mutex _compile_slot_mutex;
-	std::condition_variable _compile_slot_cv;
-	uint32_t _active_compile_workers = 0;
 	const uint32_t _hardware_thread_count = get_async_pipeline_hardware_thread_count();
 	const uint32_t _compile_worker_count = get_async_pipeline_compile_worker_count(_hardware_thread_count, async_pipeline_compile_worker_thread_percentage);
-	const uint32_t _compile_worker_lower_count = std::min(_compile_worker_count, get_async_pipeline_compile_worker_count(_hardware_thread_count, async_pipeline_compile_lower_thread_percentage));
-	const uint32_t _compile_worker_middle_count = (_compile_worker_count + _compile_worker_lower_count) / 2;
-	std::atomic<uint32_t> _compile_worker_limit { _compile_worker_count };
-	std::atomic<uint64_t> _last_recent_frame_us = 0;
-	std::atomic<uint64_t> _last_baseline_frame_us = 0;
-	std::atomic<uint64_t> _next_frame_pacing_source_id = 1;
-	moodycamel::LightweightSemaphore _frame_pacing_semaphore { 0 };
-	std::mutex _frame_pacing_mutex;
-	phmap::flat_hash_map<uint64_t, FramePacingSourceState> _frame_pacing_sources;
-	std::thread _frame_pacing_worker;
 	std::vector<std::thread> _workers;
 	std::mutex _residency_queue_mutex;
 	std::condition_variable _residency_cv;
 	std::deque<ResidencyJob> _residency_queue;
 	bool _residency_stop = false;
 	std::thread _residency_worker;
-};
-
-class D3D12AsyncPipelineFramePacing
-{
-public:
-	explicit D3D12AsyncPipelineFramePacing(D3D12AsyncPipelineManager *manager) :
-		_manager(manager), _publication(manager->register_frame_pacing_source())
-	{
-		assert(_manager != nullptr);
-	}
-	~D3D12AsyncPipelineFramePacing()
-	{
-		_manager->unregister_frame_pacing_source(_publication);
-	}
-
-	void note_present()
-	{
-		_manager->note_frame_pacing_present(_publication);
-	}
-
-private:
-	D3D12AsyncPipelineManager *const _manager;
-	const std::shared_ptr<D3D12FramePacingPublication> _publication;
 };
 
 static void enqueue_async_residency_make_resident(D3D12AsyncPipelineManager *manager, ID3D12Pageable *pageable)
@@ -3399,35 +3206,21 @@ void note_async_pipeline_fallback_draw_skip()
 	increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.fallback_draw_skips, 1);
 }
 
-void note_async_pipeline_fallback_promotion()
+bool should_skip_async_pipeline_fallback_command(bool dispatch)
 {
-	if constexpr (!async_pipeline_enabled)
-		return;
-
-	increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.fallback_promotions, 1);
-}
-
-D3D12AsyncPipelineFramePacing *create_async_pipeline_frame_pacing(D3D12AsyncPipelineManager *manager)
-{
-	if constexpr (!async_pipeline_enabled)
-		return nullptr;
-	return manager != nullptr && async_pipeline_compile_pacing ? new D3D12AsyncPipelineFramePacing(manager) : nullptr;
-}
-
-void destroy_async_pipeline_frame_pacing(D3D12AsyncPipelineFramePacing *frame_pacing)
-{
-	delete frame_pacing;
-}
-
-void note_async_pipeline_frame_present(D3D12AsyncPipelineFramePacing *frame_pacing)
-{
-	if (frame_pacing != nullptr)
-		frame_pacing->note_present();
-}
-
-bool should_skip_async_pipeline_fallback_commands()
-{
-	return async_pipeline_fallback_mode == AsyncPipelineFallbackMode::skip_commands;
+	switch (async_pipeline_fallback_mode)
+	{
+	case AsyncPipelineFallbackMode::skip_all:
+		return true;
+	case AsyncPipelineFallbackMode::allow_all:
+		return false;
+	case AsyncPipelineFallbackMode::skip_non_dispatches:
+		return !dispatch;
+	case AsyncPipelineFallbackMode::skip_dispatches:
+		return dispatch;
+	default:
+		return true;
+	}
 }
 
 void note_async_pageable_make_resident(ID3D12Pageable *pageable)
@@ -3496,9 +3289,14 @@ ID3D12PipelineState *resolve_async_pipeline_state_proxy(D3D12AsyncPipelineProxy 
 HRESULT store_async_pipeline_state_proxy_or_defer(D3D12AsyncPipelineProxy *proxy, ID3D12PipelineLibrary *library, LPCWSTR name)
 {
 	if constexpr (!async_pipeline_enabled)
-		return E_POINTER;
+		return E_INVALIDARG;
 
-	return proxy != nullptr ? proxy->store_or_defer(library, name) : E_POINTER;
+	return proxy != nullptr ? proxy->store_or_defer(library, name) : E_INVALIDARG;
+}
+
+bool should_reject_async_pipeline_library_loads()
+{
+	return async_pipeline_enabled && !defer_async_pipeline_library_stores;
 }
 
 ID3D12PipelineState *resolve_async_pipeline_state(ID3D12PipelineState *pipeline_state)

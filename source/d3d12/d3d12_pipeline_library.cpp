@@ -141,6 +141,13 @@ HRESULT STDMETHODCALLTYPE D3D12PipelineLibrary::StorePipeline(LPCWSTR pName, ID3
 }
 HRESULT STDMETHODCALLTYPE D3D12PipelineLibrary::LoadGraphicsPipeline(LPCWSTR pName, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState)
 {
+	if (should_reject_async_pipeline_library_loads())
+	{
+		if (ppPipelineState != nullptr)
+			*ppPipelineState = nullptr;
+		return E_INVALIDARG;
+	}
+
 	// Do not invoke 'create_pipeline' event, since it is not possible to modify the pipeline
 
 	HRESULT hr = _orig->LoadGraphicsPipeline(pName, pDesc, riid, ppPipelineState);
@@ -165,6 +172,13 @@ HRESULT STDMETHODCALLTYPE D3D12PipelineLibrary::LoadGraphicsPipeline(LPCWSTR pNa
 }
 HRESULT STDMETHODCALLTYPE D3D12PipelineLibrary::LoadComputePipeline(LPCWSTR pName, const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState)
 {
+	if (should_reject_async_pipeline_library_loads())
+	{
+		if (ppPipelineState != nullptr)
+			*ppPipelineState = nullptr;
+		return E_INVALIDARG;
+	}
+
 	// Do not invoke 'create_pipeline' event, since it is not possible to modify the pipeline
 
 	HRESULT hr = _orig->LoadComputePipeline(pName, pDesc, riid, ppPipelineState);
@@ -198,6 +212,12 @@ HRESULT STDMETHODCALLTYPE D3D12PipelineLibrary::Serialize(void *pData, SIZE_T Da
 HRESULT STDMETHODCALLTYPE D3D12PipelineLibrary::LoadPipeline(LPCWSTR pName, const D3D12_PIPELINE_STATE_STREAM_DESC *pDesc, REFIID riid, void **ppPipelineState)
 {
 	assert(_interface_version >= 1);
+	if (should_reject_async_pipeline_library_loads())
+	{
+		if (ppPipelineState != nullptr)
+			*ppPipelineState = nullptr;
+		return E_INVALIDARG;
+	}
 
 	// Do not invoke 'create_pipeline' event, since it is not possible to modify the pipeline
 

@@ -43,8 +43,8 @@ contract, so failures are recorded as explicit terminal proxy states.
 8. Publish the real native PSO atomically after successful creation, add-on
    initialization, metadata replay, deferred store replay, and residency replay.
 9. Resolve proxies at command-list creation, `Reset`, `ClearState`, and
-   `SetPipelineState`. Immediately before draw or dispatch, attempt just-in-time
-   promotion if the command list still records a fallback.
+  `SetPipelineState`. A command list that recorded a fallback keeps it until the
+  application binds the pipeline again; draw and dispatch do not rebind it.
 
 The scheduler uses separate normal and urgent
 `moodycamel::ConcurrentQueue<CompileJobPtr>` instances, per-worker consumer
@@ -77,28 +77,35 @@ Two fallback strategies exist:
   signature are retained. This creates more PSOs and is still not complete
   emulation of the requested pipeline.
 
-`FallbackMode=skip` is the safe default. If just-in-time promotion cannot resolve
-the real pipeline, native draw, indexed-draw, dispatch, indirect, and mesh
-dispatch commands are suppressed. Their add-on events are still emitted so
-add-ons can maintain or clear command-list state.
+`FallbackMode=0` is the safe default. The policies are:
 
-Sentinel fallbacks must never execute application commands. `FallbackMode=execute`
-is only appropriate for keyed pipeline classes that have been separately proven
-compatible. A mesh pipeline cannot execute through a classic VS/PS substitute.
+- `0`: skip all draws, dispatches, mesh dispatches, and indirect execution;
+- `1`: allow all fallback commands;
+- `2`: skip non-dispatch commands, while allowing dispatch and mesh dispatch;
+- `3`: skip dispatch and mesh dispatch, while allowing draws and indirect execution.
+
+Skipped commands still emit add-on events. `ExecuteIndirect` is classified as
+non-dispatch because command-signature contents are not tracked here. Allowing
+fallback commands is intended for keyed pipeline classes that have been proven
+compatible; a mesh pipeline cannot execute through a classic VS/PS substitute.
+
+Compute pipelines are asynchronous only when their compute shader bytecode is at
+least 64 KiB (`ComputeShaderBytecodeThreshold=65536`). Smaller classic and stream
+compute pipelines compile synchronously to avoid queueing inexpensive shaders.
 
 ## Add-on compatibility contract
 
 - Every fallback PSO receives a complete create/init/destroy add-on lifecycle.
-- Bind events publish the actual native fallback handle while a proxy is pending.
-- Promotion emits another bind event with the real native pipeline handle.
+- Fallback bind events are hidden from add-ons. A later application bind publishes
+  the real native pipeline handle after compilation completes.
 - Add-ons currently observe but cannot modify fallback descriptors.
 - Real pipeline `create_pipeline` and `init_pipeline` callbacks run on compile
   workers and may therefore be delayed and concurrent.
 - Suppressing a native command does not suppress its draw/dispatch add-on event;
   callback return values are ignored when execution is already skipped.
 
-Publishing fallback handles without their lifecycle is forbidden because add-ons
-may index metadata by pipeline handle.
+Fallback lifecycle events remain available for add-ons that track pipeline objects,
+but fallback handles are never exposed as command-list bindings.
 
 ## Cached pipelines and pipeline libraries
 
@@ -113,22 +120,12 @@ may index metadata by pipeline handle.
   incompatible descriptor, so replay failure is reported rather than retried as
   replacement.
 
-## Compile pacing
+## Compile workers
 
-Present only publishes coalesced per-source timestamps and counts. A dedicated
-pacing thread consumes the latest sample from each pending source and adjusts the
-compile-slot limit, so Present never waits on the controller or compile workers.
-
-The worker pool is 75% of hardware threads. Adaptive limits are:
-
-- full: 75%;
-- lower: 50%;
-- middle: the midpoint between full and lower.
-
-This produces 12/10/8 active native compilers on a 16-thread processor. Control
-runs at 250 ms intervals with confirmation samples and asymmetric smoothing.
-There is no bounded-queue policy, one-or-two-worker ramp-up, or 100-job override;
-logical backlog may be large while active driver compilation remains paced.
+The worker pool is fixed at 75% of available hardware threads, rounded by the
+worker-count helper. Every worker that claims a job may immediately invoke native
+pipeline creation. There is no frame-time controller, Present integration,
+compile-slot limiter, or runtime concurrency adjustment.
 
 ## Diagnostics policy
 
@@ -138,9 +135,8 @@ an initial burst. Deferred `StorePipeline` failures follow the same policy, whil
 rare native creation failures remain visible.
 
 Queue diagnostics time only direct concurrent-queue enqueue/dequeue calls and
-warn at 10 ms. Queue age is expected backlog, and compile-slot waiting is
-intentional pacing, so neither is treated as queue contention. Debug-off queue
-operations avoid diagnostic clock reads.
+warn at 10 ms. Queue age is expected backlog and is not treated as queue
+contention. Debug-off queue operations avoid diagnostic clock reads.
 
 ## Validation gates
 
@@ -158,8 +154,8 @@ operations avoid diagnostic clock reads.
    state, waiter wakeup, descriptor cleanup, and scheduler-reference release.
 8. Confirm cached fallback data cannot enter normal application caches or
    pipeline libraries with the default configuration.
-9. Compare frame-time percentiles and active-worker limits during large startup
-   bursts; do not infer contention from backlog age alone.
+9. Measure frame-time behavior during large startup bursts with the fixed worker
+  count; do not infer contention from backlog age alone.
 10. Test add-ons with lifecycle, bind, command, and creation-mutating callbacks,
     including add-ons that retain pipeline metadata.
 
@@ -170,18 +166,17 @@ operations avoid diagnostic clock reads.
 2. Stress native-skip/add-on-event behavior for draw, indexed draw, dispatch,
    indirect, and mesh dispatch.
 3. Stress promotion and shutdown races under very large startup backlogs.
-4. Measure 12/10/8 pacing across multiple games and Present sources.
+4. Measure the fixed 75% worker pool across multiple games and hardware thread counts.
 5. Investigate add-ons that are not safe under concurrent worker-side creation
    callbacks; keep add-on-specific races separate from scheduler correctness.
 
 ## Relevant files
 
 - `d3d12_async_pipeline.cpp` / `.hpp` — proxy, descriptor copies, fallbacks,
-  scheduler, pacing, residency, and diagnostics.
+  scheduler, residency, and diagnostics.
 - `d3d12_device.cpp` / `.hpp` — creation interception, stream handling,
   residency, and command-list initialization.
 - `d3d12_command_list.cpp` / `.hpp` — proxy resolution, fallback tracking,
   promotion, command suppression, and add-on command events.
-- `../dxgi/dxgi_swapchain.cpp` / `.hpp` — Present pacing-source publication.
 - `../../deps/concurrentqueue` — lock-free queues and lightweight semaphores.
 - `../../deps/parallel-hashmap` — synchronized sharded registries and caches.

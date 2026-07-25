@@ -9,7 +9,6 @@
 
 class D3D12DeviceDownlevel;
 class D3D12AsyncPipelineManager;
-class D3D12AsyncPipelineFramePacing;
 
 class DECLSPEC_UUID("2523AFF4-978B-4939-BA16-8EE876A4CB2A") D3D12Device final : public ID3D12Device14, public reshade::d3d12::device_impl
 {
@@ -138,7 +137,6 @@ public:
 	#pragma endregion
 
 	bool check_and_upgrade_interface(REFIID riid);
-	D3D12AsyncPipelineFramePacing *create_async_pipeline_frame_pacing();
 
 #if RESHADE_ADDON
 	void invoke_init_resource_event(const reshade::api::resource_desc &desc, reshade::api::resource_usage initial_state, ID3D12Resource *resource);

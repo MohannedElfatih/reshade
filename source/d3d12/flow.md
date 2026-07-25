@@ -154,31 +154,7 @@ _compile_work_semaphore.wait();
 
 This blocks without polling.
 
-A successful wait consumes one token, which means at least one physical entry was published into one of the two queues.
-
-The semaphore is independent of compile pacing:
-
-```text
-work semaphore:
-    Is there a queue entry?
-
-compile-slot limiter:
-    Is this worker currently allowed to compile?
-```
-
----
-
-## 7. The worker obtains a compile slot
-
-After receiving a work token, the worker calls `acquire_compile_worker_slot`.
-
-The worker may wait here if frame pacing currently limits active compilation.
-
-Importantly, consuming the semaphore token does not remove a queue entry. Work remains visible in the queues while the worker waits for a slot.
-
-Other workers with other tokens may still claim available jobs.
-
-Once the worker obtains a slot, it is permitted to start one native D3D12 pipeline creation.
+A successful wait consumes one token, which means at least one physical entry was published into one of the two queues. The worker then proceeds directly to dequeue and claim work. The pool size is fixed at 75% of available hardware threads.
 
 ---
 
@@ -223,7 +199,7 @@ Only one compare-and-exchange can win.
 
 Therefore, even if the same job physically appears in both queues, exactly one worker can compile it.
 
-If neither transition succeeds, the entry is stale. The worker releases its compile slot and returns to waiting for another semaphore token.
+If neither transition succeeds, the entry is stale. The worker returns to waiting for another semaphore token.
 
 ---
 
@@ -373,26 +349,7 @@ After winning `claimed`, the worker invokes:
 - `CreateComputePipelineState`; or
 - `ID3D12Device2::CreatePipelineState`.
 
-No scheduler queue or map lock is held during this operation.
-
-Only the compile-slot permit remains active, so frame pacing knows this worker is performing native driver compilation.
-
----
-
-## 16. Releasing the compile slot
-
-Once the native D3D12 creation call finishes, the worker releases the compile slot.
-
-This permits another worker to begin native compilation even while the first worker performs its completion work:
-
-- validation logging;
-- metadata replay;
-- deferred pipeline-store replay;
-- residency replay;
-- proxy publication;
-- scheduler cleanup.
-
-Therefore the compile limit measures active native PSO creation rather than the entire completion tail.
+No scheduler queue or map lock is held during this operation. The fixed worker count is the only concurrency limit.
 
 ---
 
@@ -418,7 +375,7 @@ The proxy:
 
 Future binds resolve directly to the real PSO.
 
-A command list that previously recorded a fallback may also perform just-in-time promotion before draw or dispatch.
+A command list that previously recorded a fallback keeps that binding until the application binds the pipeline again. Draw and dispatch do not perform an implicit real-PSO rebind.
 
 ---
 
@@ -502,7 +459,7 @@ priority_queued → claimed  // fails
 queued → claimed           // fails
 ```
 
-The worker releases its compile slot and waits for another token.
+The worker waits for another token.
 
 No map lookup, D3D12 creation, proxy call, or descriptor work occurs.
 
@@ -527,7 +484,7 @@ After the exclusive lock is released:
 
 ## 23. Workers are awakened and joined
 
-Shutdown signals enough semaphore tokens to awaken all workers and notifies the compile-slot condition variable.
+Shutdown signals enough semaphore tokens to awaken all workers.
 
 Workers check `_stop` immediately after waking and return without claiming new jobs.
 
@@ -583,8 +540,7 @@ flowchart TD
     Priority --> Semaphore
 
     Semaphore --> Worker[Compile worker wakes]
-    Worker --> Slot[Acquire pacing slot]
-    Slot --> Select[Urgent first, then normal]
+    Worker --> Select[Urgent first, then normal]
     Select --> Claim[Atomic transition to claimed]
     Claim --> Native[Native D3D12 creation]
 
@@ -603,7 +559,7 @@ The key separation is:
 - **The parallel map** finds and owns unfinished jobs by ID.
 - **Atomic job state** decides who may compile.
 - **The semaphore** parks and wakes workers.
-- **The slot limiter** controls how many workers may invoke native D3D12 creation.
+- **The fixed worker pool** limits concurrent native D3D12 creation.
 - **The lifecycle mutex** only coordinates normal admission with shutdown.
 
 ---
@@ -612,30 +568,30 @@ The key separation is:
 
 ## 25. Fallback pipelines have a complete add-on lifecycle
 
-Fallback PSOs are ordinary native pipelines from an add-on's perspective. Their
-creation invokes the normal `create_pipeline` and `init_pipeline` events, and
-their destruction invokes the matching lifecycle event. Add-ons are informed of
-the actual native fallback handle rather than the proxy handle.
+Fallback PSO creation invokes the normal `create_pipeline` and `init_pipeline`
+events, and destruction invokes the matching lifecycle event. Their handles are
+not exposed through command-list `bind_pipeline` events.
 
 Add-ons currently observe but do not modify fallback descriptors. This keeps the
 manager's fallback compatibility assumptions stable while still giving add-ons
 enough lifecycle information to associate metadata with every handle they see.
 
-## 26. Bind events report the currently bound native pipeline
+## 26. Bind events hide pending fallback pipelines
 
 While a proxy is pending, command-list initialization, `Reset`, `ClearState`, and
-`SetPipelineState` publish a `bind_pipeline` event containing the native fallback
-handle. When just-in-time promotion replaces that fallback with the completed
-pipeline, a second bind event publishes the real native handle.
+`SetPipelineState` do not publish a `bind_pipeline` event for the native fallback.
+The pending bind still prioritizes its compile job. Once compilation completes, a
+later application bind resolves the proxy and publishes the real native handle.
+Already-recorded command lists are not rebound immediately before draw or dispatch.
 
-This avoids presenting an unknown handle to add-ons and lets their command-list
-state match the pipeline that ReShade actually recorded.
+## 27. Fallback modes select which native work is suppressed
 
-## 27. Skip mode suppresses native work, not add-on observation
-
-With `FallbackMode=skip`, unresolved fallback draws, indexed draws, dispatches,
+With `FallbackMode=0`, unresolved fallback draws, indexed draws, dispatches,
 indirect commands, and mesh dispatches are not sent to the native D3D12 command
-list. Their corresponding add-on events are still invoked before returning.
+list. Mode `1` allows all, mode `2` skips non-dispatch commands, and mode `3`
+skips dispatch and mesh dispatch only. Indirect execution is treated as
+non-dispatch because command-signature contents are not tracked here. The
+corresponding add-on events are still invoked before a skipped command returns.
 
 The callback return value is irrelevant in this path because native execution is
 already suppressed. Emitting the event lets add-ons perform per-command cleanup
@@ -643,39 +599,19 @@ and maintain consistent state even when no GPU work is recorded.
 
 ---
 
-# Frame pacing and diagnostics
+# Compile-worker policy and diagnostics
 
-## 28. Present publishes coalesced pacing samples
+## 28. Worker concurrency is fixed
 
-Present does not wait for compile workers or run the pacing controller. Each
-pacing source atomically publishes its latest Present timestamp and monotonic
-Present count, then signals a dedicated pacing semaphore only when that source
-transitions from not-pending to pending.
+The compile pool contains 75% of available hardware threads. This count is
+chosen when the manager is constructed and does not change at runtime. Present
+does not publish compile-control data, and workers do not wait on a secondary
+slot limiter after receiving queue work.
 
-The pacing thread drains the latest sample from each pending source. Multiple
-Presents may therefore coalesce into one update without building another FIFO
-backlog. The controller aggregates all sources and updates the compile-slot limit
-outside the Present critical path.
+## 29. Queue diagnostics measure implementation stalls only
 
-## 29. Worker limits use full, middle, and lower tiers
-
-The compile pool contains 75% of available hardware threads. Congestion pacing
-uses three derived limits:
-
-```text
-full   = 75% of hardware threads
-lower  = 50% of hardware threads
-middle = midpoint between full and lower
-```
-
-On a 16-thread processor these are 12, 10, and 8 active native compilers. The
-controller evaluates changes at 250 ms intervals and requires confirmation
-samples to avoid reacting to isolated frame-time noise.
-
-## 30. Queue diagnostics measure implementation stalls only
-
-Queue backlog age and compile-slot wait time are intentionally not warnings:
-they represent expected startup backlog and deliberate pacing. With
+Queue backlog age is intentionally not a warning because it represents expected
+startup backlog. With
 `[ASYNC] Debug=1`, timing surrounds only direct concurrent-queue enqueue and
 dequeue operations. An operation taking at least 10 ms is logged as a potential
 queue implementation stall.
