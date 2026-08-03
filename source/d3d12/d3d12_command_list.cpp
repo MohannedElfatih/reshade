@@ -5,6 +5,7 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_command_list.hpp"
+#include "d3d12_async_pipeline.hpp"
 #include "d3d12_descriptor_heap.hpp"
 #include "d3d12_impl_type_convert.hpp"
 #include "dll_log.hpp"
@@ -24,9 +25,28 @@ D3D12GraphicsCommandList::D3D12GraphicsCommandList(D3D12Device *device, ID3D12Gr
 }
 D3D12GraphicsCommandList::~D3D12GraphicsCommandList()
 {
+	reset_async_pipeline_state_cache();
+
 #if RESHADE_ADDON
 	reshade::invoke_addon_event<reshade::addon_event::destroy_command_list>(this);
 #endif
+}
+
+void D3D12GraphicsCommandList::reset_async_pipeline_state_cache()
+{
+	if (_async_pipeline_state_cache_proxy != nullptr)
+	{
+		release_async_pipeline_state_proxy(_async_pipeline_state_cache_proxy);
+		_async_pipeline_state_cache_proxy = nullptr;
+	}
+	_async_pipeline_state_cache_input = nullptr;
+}
+
+void D3D12GraphicsCommandList::set_async_pipeline_state_cache(ID3D12PipelineState *pipeline_state)
+{
+	reset_async_pipeline_state_cache();
+	_async_pipeline_state_cache_input = pipeline_state;
+	_async_pipeline_state_cache_proxy = get_async_pipeline_state_proxy(pipeline_state);
 }
 
 bool D3D12GraphicsCommandList::check_and_upgrade_interface(REFIID riid)
@@ -174,14 +194,19 @@ HRESULT STDMETHODCALLTYPE D3D12GraphicsCommandList::Reset(ID3D12CommandAllocator
 	_previous_descriptor_heaps[0] = nullptr;
 	_previous_descriptor_heaps[1] = nullptr;
 #endif
+	reset_async_pipeline_state_cache();
+	set_async_pipeline_state_cache(pInitialState);
 
-	const HRESULT hr = _orig->Reset(pAllocator, pInitialState);
+	bool initial_state_is_fallback = false;
+	ID3D12PipelineState *const initial_state = _async_pipeline_state_cache_proxy != nullptr ? resolve_async_pipeline_state_proxy(_async_pipeline_state_cache_proxy, &initial_state_is_fallback) : resolve_async_pipeline_state(pInitialState, &initial_state_is_fallback);
+	const HRESULT hr = _orig->Reset(pAllocator, initial_state);
+	_async_pipeline_state_is_fallback = SUCCEEDED(hr) && initial_state_is_fallback;
 #if RESHADE_ADDON >= 2
 	if (SUCCEEDED(hr))
 	{
 		// Only invoke event if there actually is an initial state to bind, otherwise expect things were already handled by the 'reset_command_list' event above
-		if (pInitialState != nullptr)
-			reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, to_handle(pInitialState));
+		if (initial_state != nullptr && !initial_state_is_fallback)
+			reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, to_handle(initial_state));
 	}
 #endif
 
@@ -190,7 +215,13 @@ HRESULT STDMETHODCALLTYPE D3D12GraphicsCommandList::Reset(ID3D12CommandAllocator
 
 void STDMETHODCALLTYPE D3D12GraphicsCommandList::ClearState(ID3D12PipelineState *pPipelineState)
 {
-	_orig->ClearState(pPipelineState);
+	reset_async_pipeline_state_cache();
+	set_async_pipeline_state_cache(pPipelineState);
+
+	bool pipeline_state_is_fallback = false;
+	ID3D12PipelineState *const pipeline_state = _async_pipeline_state_cache_proxy != nullptr ? resolve_async_pipeline_state_proxy(_async_pipeline_state_cache_proxy, &pipeline_state_is_fallback) : resolve_async_pipeline_state(pPipelineState, &pipeline_state_is_fallback);
+	_orig->ClearState(pipeline_state);
+	_async_pipeline_state_is_fallback = pipeline_state_is_fallback;
 
 	_current_root_signature[0] = nullptr;
 	_current_root_signature[1] = nullptr;
@@ -200,7 +231,8 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::ClearState(ID3D12PipelineState 
 	_previous_descriptor_heaps[0] = nullptr;
 	_previous_descriptor_heaps[1] = nullptr;
 
-	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, to_handle(pPipelineState));
+	if (pipeline_state != nullptr && !pipeline_state_is_fallback)
+		reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, to_handle(pipeline_state));
 
 	// When 'ClearState' is called, all currently bound resources are unbound.
 	// The primitive topology is set to D3D_PRIMITIVE_TOPOLOGY_UNDEFINED. Viewports, scissor rectangles, stencil reference value, and the blend factor are set to empty values (all zeros).
@@ -224,6 +256,16 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::ClearState(ID3D12PipelineState 
 }
 void STDMETHODCALLTYPE D3D12GraphicsCommandList::DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation)
 {
+	if (_async_pipeline_state_is_fallback && should_skip_async_pipeline_fallback_command(false))
+	{
+			// _orig->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+			note_async_pipeline_fallback_draw_skip();
+#if RESHADE_ADDON
+			reshade::invoke_addon_event<reshade::addon_event::draw>(this, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+#endif
+			return;
+	}
+
 #if RESHADE_ADDON
 	if (reshade::invoke_addon_event<reshade::addon_event::draw>(this, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation))
 		return;
@@ -232,6 +274,16 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DrawInstanced(UINT VertexCountP
 }
 void STDMETHODCALLTYPE D3D12GraphicsCommandList::DrawIndexedInstanced(UINT IndexCountPerInstance, UINT InstanceCount, UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation)
 {
+	if (_async_pipeline_state_is_fallback && should_skip_async_pipeline_fallback_command(false))
+	{
+			// _orig->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+			note_async_pipeline_fallback_draw_skip();
+#if RESHADE_ADDON
+			reshade::invoke_addon_event<reshade::addon_event::draw_indexed>(this, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+#endif
+			return;
+	}
+
 #if RESHADE_ADDON
 	if (reshade::invoke_addon_event<reshade::addon_event::draw_indexed>(this, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation))
 		return;
@@ -240,6 +292,16 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DrawIndexedInstanced(UINT Index
 }
 void STDMETHODCALLTYPE D3D12GraphicsCommandList::Dispatch(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ)
 {
+	if (_async_pipeline_state_is_fallback && should_skip_async_pipeline_fallback_command(true))
+	{
+			// _orig->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+			note_async_pipeline_fallback_draw_skip();
+#if RESHADE_ADDON
+			reshade::invoke_addon_event<reshade::addon_event::dispatch>(this, ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+#endif
+			return;
+	}
+
 #if RESHADE_ADDON
 	if (reshade::invoke_addon_event<reshade::addon_event::dispatch>(this, ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ))
 		return;
@@ -442,10 +504,27 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::OMSetStencilRef(UINT StencilRef
 }
 void STDMETHODCALLTYPE D3D12GraphicsCommandList::SetPipelineState(ID3D12PipelineState *pPipelineState)
 {
-	_orig->SetPipelineState(pPipelineState);
+	bool pipeline_state_is_fallback = false;
+	ID3D12PipelineState *pipeline_state = pPipelineState;
+	if (pPipelineState == _async_pipeline_state_cache_input)
+	{
+		if (_async_pipeline_state_cache_proxy != nullptr)
+			pipeline_state = resolve_async_pipeline_state_proxy(_async_pipeline_state_cache_proxy, &pipeline_state_is_fallback);
+	}
+	else
+	{
+		reset_async_pipeline_state_cache();
+		_async_pipeline_state_cache_input = pPipelineState;
+		_async_pipeline_state_cache_proxy = get_async_pipeline_state_proxy(pPipelineState);
+		if (_async_pipeline_state_cache_proxy != nullptr)
+			pipeline_state = resolve_async_pipeline_state_proxy(_async_pipeline_state_cache_proxy, &pipeline_state_is_fallback);
+	}
+	_orig->SetPipelineState(pipeline_state);
+	_async_pipeline_state_is_fallback = pipeline_state_is_fallback;
 
 #if RESHADE_ADDON >= 2
-	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, to_handle(pPipelineState));
+	if (pipeline_state != nullptr && !pipeline_state_is_fallback)
+		reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, to_handle(pipeline_state));
 #endif
 }
 void STDMETHODCALLTYPE D3D12GraphicsCommandList::ResourceBarrier(UINT NumBarriers, const D3D12_RESOURCE_BARRIER *pBarriers)
@@ -926,6 +1005,16 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::EndEvent()
 }
 void STDMETHODCALLTYPE D3D12GraphicsCommandList::ExecuteIndirect(ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgumentBuffer, UINT64 ArgumentBufferOffset, ID3D12Resource *pCountBuffer, UINT64 CountBufferOffset)
 {
+	if (_async_pipeline_state_is_fallback && should_skip_async_pipeline_fallback_command(false))
+	{
+			// _orig->ExecuteIndirect(pCommandSignature, MaxCommandCount, pArgumentBuffer, ArgumentBufferOffset, pCountBuffer, CountBufferOffset);
+			note_async_pipeline_fallback_draw_skip();
+#if RESHADE_ADDON
+			reshade::invoke_addon_event<reshade::addon_event::draw_or_dispatch_indirect>(this, reshade::api::indirect_command::unknown, to_handle(pArgumentBuffer), ArgumentBufferOffset, MaxCommandCount, 0);
+#endif
+			return;
+	}
+
 #if RESHADE_ADDON
 	if (reshade::invoke_addon_event<reshade::addon_event::draw_or_dispatch_indirect>(this, reshade::api::indirect_command::unknown, to_handle(pArgumentBuffer), ArgumentBufferOffset, MaxCommandCount, 0))
 		return;
@@ -1185,8 +1274,18 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DispatchMesh(UINT ThreadGroupCo
 {
 	assert(_interface_version >= 6);
 
+	if (_async_pipeline_state_is_fallback && should_skip_async_pipeline_fallback_command(true))
+	{
+			// _orig->DispatchMesh(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+			note_async_pipeline_fallback_draw_skip();
 #if RESHADE_ADDON
-	if (reshade::invoke_addon_event<reshade::addon_event::dispatch_mesh>(this, ThreadGroupCountX, ThreadGroupCountX, ThreadGroupCountZ))
+			reshade::invoke_addon_event<reshade::addon_event::dispatch_mesh>(this, ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+#endif
+			return;
+	}
+
+#if RESHADE_ADDON
+	if (reshade::invoke_addon_event<reshade::addon_event::dispatch_mesh>(this, ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ))
 		return;
 #endif
 

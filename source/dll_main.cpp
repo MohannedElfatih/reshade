@@ -93,11 +93,9 @@ std::filesystem::path get_module_path(HMODULE module)
 
 #ifndef RESHADE_TEST_APPLICATION
 
-#ifndef NDEBUG
 #include <DbgHelp.h>
 
 static PVOID s_exception_handler_handle = nullptr;
-#endif
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 {
@@ -210,13 +208,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 				}
 			}
 
+			const bool enable_async_minidump = config.get("ASYNC", "EnableMiniDump");
 #ifndef NDEBUG
-			if (config.get("INSTALL", "DumpExceptions"))
+			const bool enable_debug_minidump = config.get("INSTALL", "DumpExceptions");
+#else
+			const bool enable_debug_minidump = false;
+#endif
+			if (enable_async_minidump || enable_debug_minidump)
 			{
+				reshade::log::message(reshade::log::level::info, "Exception minidumps enabled (%s).", enable_async_minidump ? "[ASYNC] EnableMiniDump" : "[INSTALL] DumpExceptions");
 				// Load debug helper library as soon as possible, so that it is later available when an exception is handled
 				CreateThread(nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(&LoadLibraryW), const_cast<LPVOID>(static_cast<LPCVOID>(L"dbghelp.dll")), 0, nullptr);
 
 				s_exception_handler_handle = AddVectoredExceptionHandler(1, [](PEXCEPTION_POINTERS ex) -> LONG {
+					LONG current_dump_index = 0;
 					// Ignore debugging and some common language exceptions
 					if (const DWORD code = ex->ExceptionRecord->ExceptionCode;
 						code == CONTROL_C_EXIT || code == 0x406D1388 /* SetThreadName */ ||
@@ -226,8 +231,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 						((code ^ 0xE24C4A00) <= 0xFF) /* LuaJIT exception */)
 						goto continue_search;
 
-					// Create dump with exception information for the first 100 occurrences
-					if (static unsigned int dump_index = 0; dump_index < 100)
+					// Create a dump with exception information for the first 100 occurrences.
+					// InterlockedIncrement makes this safe when several crashing threads enter together.
+					static volatile LONG dump_index = 0;
+					current_dump_index = InterlockedIncrement(&dump_index) - 1;
+					if (current_dump_index < 100)
 					{
 						const auto dbghelp_module = GetModuleHandleW(L"dbghelp.dll");
 						if (dbghelp_module == nullptr)
@@ -238,11 +246,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 						if (dbghelp_write_dump == nullptr)
 							goto continue_search;
 
-						char dump_name[] = "exception_00.dmp";
-						dump_name[10] = '0' + static_cast<char>(dump_index / 10);
-						dump_name[11] = '0' + static_cast<char>(dump_index % 10);
+						WCHAR dump_name[] = L"ReShade-async-crash-000.dmp";
+						dump_name[20] = L'0' + static_cast<WCHAR>((current_dump_index / 100) % 10);
+						dump_name[21] = L'0' + static_cast<WCHAR>((current_dump_index / 10) % 10);
+						dump_name[22] = L'0' + static_cast<WCHAR>(current_dump_index % 10);
 
-						const HANDLE file = CreateFileA(dump_name, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+						const std::filesystem::path dump_path = g_reshade_base_path / dump_name;
+						const HANDLE file = CreateFileW(dump_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 						if (file == INVALID_HANDLE_VALUE)
 							goto continue_search;
 
@@ -251,8 +261,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 						info.ExceptionPointers = ex;
 						info.ClientPointers = TRUE;
 
-						if (dbghelp_write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, MiniDumpNormal, &info, nullptr, nullptr))
-							dump_index++;
+						if (dbghelp_write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules | MiniDumpWithIndirectlyReferencedMemory), &info, nullptr, nullptr))
+							reshade::log::message(reshade::log::level::error, "Wrote exception minidump to '%s'.", dump_path.u8string().c_str());
 						else
 							reshade::log::message(reshade::log::level::error, "Failed to write minidump!");
 
@@ -263,7 +273,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 					return EXCEPTION_CONTINUE_SEARCH;
 				});
 			}
-#endif
 
 			if (config.get("INSTALL", "PreventUnloading"))
 			{
@@ -394,10 +403,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 				CloseHandle(g_exit_event);
 			}
 
-#ifndef NDEBUG
 			if (s_exception_handler_handle != nullptr)
 				RemoveVectoredExceptionHandler(s_exception_handler_handle);
-#endif
 
 			reshade::log::message(reshade::log::level::info, "Finished exiting.");
 		}

@@ -9,8 +9,8 @@
 #include "d3d11/d3d11_device.hpp"
 #include "d3d11/d3d11_device_context.hpp"
 #include "d3d11/d3d11_impl_swapchain.hpp"
-#include "d3d12/d3d12_device.hpp"
 #include "d3d12/d3d12_command_queue.hpp"
+#include "d3d12/d3d12_device.hpp"
 #include "d3d12/d3d12_impl_swapchain.hpp"
 #include "dll_log.hpp" // Include late to get 'hr_to_string' helper function
 #include "com_utils.hpp"
@@ -94,7 +94,6 @@ DXGISwapChain::DXGISwapChain(IDXGIFactory *factory, D3D12CommandQueue *command_q
 	_direct3d_device->AddRef();
 	// Add reference to command queue as well to ensure it is kept alive for the lifetime of the effect runtime
 	_direct3d_command_queue->AddRef();
-
 	for (size_t i = 0; i < std::size(_direct3d_command_queue_per_back_buffer); ++i)
 		_direct3d_command_queue_per_back_buffer[i] = _direct3d_command_queue;
 

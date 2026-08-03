@@ -171,6 +171,9 @@
     <ClCompile Include="source\d3d12\d3d12.cpp">
       <Filter>hooks\d3d12</Filter>
     </ClCompile>
+    <ClCompile Include="source\d3d12\d3d12_async_pipeline.cpp">
+      <Filter>hooks\d3d12</Filter>
+    </ClCompile>
     <ClCompile Include="source\d3d12\d3d12_command_list.cpp">
       <Filter>hooks\d3d12</Filter>
     </ClCompile>
@@ -563,6 +566,12 @@
     <ClInclude Include="source\d3d11\d3d11_resource_call_vtable.inl">
       <Filter>hooks\d3d11</Filter>
     </ClInclude>
+    <ClInclude Include="source\d3d12\d3d12_async_pipeline.hpp">
+      <Filter>hooks\d3d12</Filter>
+    </ClInclude>
+    <ClInclude Include="source\d3d12\d3d12_async_pipeline_shaders.hpp">
+      <Filter>hooks\d3d12</Filter>
+    </ClInclude>
     <ClInclude Include="source\d3d12\d3d12_command_list.hpp">
       <Filter>hooks\d3d12</Filter>
     </ClInclude>
@@ -801,6 +810,12 @@
     <None Include="res\shaders\mipmap_cs_430.glsl">
       <Filter>resources\shaders</Filter>
     </None>
+	<None Include="source\d3d12\d3d12_async_pipeline_fallback_ms.hlsl">
+	  <Filter>api\d3d12</Filter>
+	</None>
+	<None Include="source\d3d12\d3d12_async_pipeline_fallback_ps.hlsl">
+	  <Filter>api\d3d12</Filter>
+	</None>
     <None Include="res\version.rc2">
       <Filter>resources</Filter>
     </None>
