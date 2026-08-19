@@ -16,6 +16,7 @@
 #include <lightweightsemaphore.h>
 #include <parallel_hashmap/phmap.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -74,8 +75,6 @@ struct AsyncPipelineDiagnostics
 	std::atomic<uint64_t> priority_jobs_selected = 0;
 	std::atomic<uint64_t> async_compile_successes = 0;
 	std::atomic<uint64_t> async_compile_failures = 0;
-	std::atomic<uint64_t> async_compile_total_us = 0;
-	std::atomic<uint64_t> async_compile_max_us = 0;
 	std::atomic<uint64_t> proxy_resolves = 0;
 	std::atomic<uint64_t> proxy_resolves_to_fallback = 0;
 	std::atomic<uint64_t> proxy_resolves_to_real = 0;
@@ -264,7 +263,6 @@ static void log_async_pipeline_diagnostics_timing_row(const char *name_a, double
 static void log_async_pipeline_diagnostics(const char *reason)
 {
 	const uint64_t compile_successes = g_async_pipeline_diagnostics.async_compile_successes.load(std::memory_order_relaxed);
-	const uint64_t compile_total_us = g_async_pipeline_diagnostics.async_compile_total_us.load(std::memory_order_relaxed);
 	reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO %s diagnostics (sentinel=%u, fallback_mode=%s):", reason, use_global_sentinel_fallback_pso, get_async_pipeline_fallback_mode_name());
 	reshade::log::message(reshade::log::level::info, "          +--------------------------+------------------+--------------------------+------------------+");
 	reshade::log::message(reshade::log::level::info, "          | Counter                  | Value            | Counter                  | Value            |");
@@ -281,7 +279,6 @@ static void log_async_pipeline_diagnostics(const char *reason)
 	log_async_pipeline_diagnostics_row("normal_selected", g_async_pipeline_diagnostics.normal_jobs_selected.load(std::memory_order_relaxed), "priority_selected", g_async_pipeline_diagnostics.priority_jobs_selected.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_row("pending_binds", g_async_pipeline_diagnostics.pending_proxy_binds.load(std::memory_order_relaxed), "compile_ok", compile_successes);
 	log_async_pipeline_diagnostics_row("compile_fail", g_async_pipeline_diagnostics.async_compile_failures.load(std::memory_order_relaxed), "proxy_resolves", g_async_pipeline_diagnostics.proxy_resolves.load(std::memory_order_relaxed));
-	log_async_pipeline_diagnostics_timing_row("compile_avg_ms", compile_successes != 0 ? static_cast<double>(compile_total_us) / static_cast<double>(compile_successes) / 1000.0 : 0.0, "compile_max_ms", static_cast<double>(g_async_pipeline_diagnostics.async_compile_max_us.load(std::memory_order_relaxed)) / 1000.0);
 	log_async_pipeline_diagnostics_row("resolves_fallback", g_async_pipeline_diagnostics.proxy_resolves_to_fallback.load(std::memory_order_relaxed), "resolves_real", g_async_pipeline_diagnostics.proxy_resolves_to_real.load(std::memory_order_relaxed));
 	log_async_pipeline_diagnostics_row("pageable_resolves", g_async_pipeline_diagnostics.pageable_proxy_resolves.load(std::memory_order_relaxed), "get_cached_blob", g_async_pipeline_diagnostics.get_cached_blob_calls.load(std::memory_order_relaxed));
 	const uint64_t cached_blob_waits = g_async_pipeline_diagnostics.get_cached_blob_waits.load(std::memory_order_relaxed);
@@ -891,6 +888,65 @@ struct ComputeFallbackKeyHash
 	}
 };
 
+enum class AsyncPipelineShaderStage : uint8_t
+{
+	vertex,
+	pixel,
+	domain,
+	hull,
+	geometry,
+	compute,
+	amplification,
+	mesh,
+	count,
+};
+
+enum class AsyncPipelineShaderIdentityKind : uint8_t
+{
+	container_digest,
+	full_hash,
+};
+
+struct AsyncPipelineShaderKey
+{
+	uint64_t identity_low = 0;
+	uint64_t identity_high = 0;
+	uint64_t size = 0;
+	AsyncPipelineShaderStage stage = AsyncPipelineShaderStage::vertex;
+	AsyncPipelineShaderIdentityKind identity_kind = AsyncPipelineShaderIdentityKind::container_digest;
+
+	bool operator==(const AsyncPipelineShaderKey &other) const
+	{
+		return identity_low == other.identity_low &&
+			identity_high == other.identity_high &&
+			size == other.size &&
+			stage == other.stage &&
+			identity_kind == other.identity_kind;
+	}
+};
+
+struct AsyncPipelineShaderKeyHash
+{
+	size_t operator()(const AsyncPipelineShaderKey &key) const
+	{
+		size_t hash = static_cast<size_t>(key.identity_low);
+		hash ^= static_cast<size_t>(key.identity_low >> 32) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+		hash ^= static_cast<size_t>(key.identity_high) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+		hash ^= static_cast<size_t>(key.identity_high >> 32) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+		hash ^= static_cast<size_t>(key.size) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+		hash ^= static_cast<size_t>(key.stage) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+		hash ^= static_cast<size_t>(key.identity_kind) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+		return hash;
+	}
+};
+
+struct AsyncPipelineShaderHashes
+{
+	std::array<AsyncPipelineShaderKey, static_cast<size_t>(AsyncPipelineShaderStage::count)> keys = {};
+	size_t count = 0;
+	bool available = false;
+};
+
 struct CopiedGraphicsPipelineDesc
 {
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
@@ -1227,6 +1283,20 @@ struct CopiedPipelineStateStream
 		valid = true;
 	}
 };
+
+template <typename Callback>
+static HRESULT invoke_timed_pipeline_creation(D3D12PipelineCreationTiming *timing, D3D12PipelineCreationApi api, Callback &&callback)
+{
+	if (timing == nullptr)
+		return callback();
+
+	const auto create_start = std::chrono::steady_clock::now();
+	const HRESULT hr = callback();
+	timing->duration_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - create_start).count());
+	timing->api = api;
+	timing->available = true;
+	return hr;
+}
 
 static D3D12_BLEND_DESC make_default_blend_desc()
 {
@@ -1650,6 +1720,7 @@ public:
 		assert(_device_proxy != nullptr);
 		assert(_device != nullptr);
 		_compile_jobs.reserve(async_pipeline_unordered_map_reserve);
+		_compiled_shader_hashes.reserve(async_pipeline_unordered_map_reserve);
 		if (!use_global_sentinel_fallback_pso)
 		{
 			_fallback_cache.reserve(async_pipeline_keyed_fallback_reserve);
@@ -1716,26 +1787,30 @@ public:
 			if (riid == __uuidof(ID3D12PipelineState1))
 				increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.graphics_pipeline_state1_requests, 1);
 			increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.sync_unsupported_interface, 1);
-			return _device->CreateGraphicsPipelineState(desc, riid, pipeline_state);
+			return create_graphics_pipeline_state_synchronously(desc, riid, pipeline_state);
 		}
 
 		if constexpr (!async_graphics_fallback_enabled)
 		{
 			note_async_pipeline_unsupported_desc("graphics async fallback disabled for compute-only test");
-			return _device->CreateGraphicsPipelineState(desc, riid, pipeline_state);
+			return create_graphics_pipeline_state_synchronously(desc, riid, pipeline_state);
 		}
 
 		const char *unsupported_reason = "none";
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC working_desc = *desc;
+		const AsyncPipelineShaderHashes shader_hashes = get_shader_hashes(working_desc);
+		if (are_all_shader_hashes_compiled(shader_hashes))
+			return create_graphics_pipeline_state_synchronously(desc, riid, pipeline_state, &shader_hashes);
+
 		if (requires_safe_mode_synchronous_creation(working_desc, false, unsupported_reason))
 		{
 			note_async_pipeline_unsupported_desc(unsupported_reason);
-			return _device->CreateGraphicsPipelineState(desc, riid, pipeline_state);
+			return create_graphics_pipeline_state_synchronously(desc, riid, pipeline_state, &shader_hashes);
 		}
 		if (!is_supported(working_desc, unsupported_reason, true, use_global_sentinel_fallback_pso))
 		{
 			note_async_pipeline_unsupported_desc(unsupported_reason);
-			return _device->CreateGraphicsPipelineState(desc, riid, pipeline_state);
+			return create_graphics_pipeline_state_synchronously(desc, riid, pipeline_state, &shader_hashes);
 		}
 
 		com_ptr<ID3D12PipelineState> fallback;
@@ -1744,7 +1819,7 @@ public:
 		{
 			increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.sync_fallback_failure, 1);
 			reshade::log::message(reshade::log::level::warning, "[ASYNC] Async D3D12 PSO: fallback creation failed with error code %s; falling back to synchronous real PSO creation.", reshade::log::hr_to_string(fallback_hr).c_str());
-			return _device->CreateGraphicsPipelineState(desc, riid, pipeline_state);
+			return create_graphics_pipeline_state_synchronously(desc, riid, pipeline_state, &shader_hashes);
 		}
 
 		const uint64_t id = _next_proxy_id.fetch_add(1, std::memory_order_relaxed);
@@ -1753,6 +1828,7 @@ public:
 		CompileJob job = {};
 		job.proxy = proxy;
 		job.graphics_desc = std::make_unique<CopiedGraphicsPipelineDesc>(working_desc);
+		job.shader_hashes = shader_hashes;
 		job.id = id;
 		enqueue_compile_job(std::move(job));
 
@@ -1776,19 +1852,25 @@ public:
 			if (riid == __uuidof(ID3D12PipelineState1))
 				increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.compute_pipeline_state1_requests, 1);
 			increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.sync_unsupported_interface, 1);
-			return _device->CreateComputePipelineState(desc, riid, pipeline_state);
+			return create_compute_pipeline_state_synchronously(desc, riid, pipeline_state);
 		}
 
 		if constexpr (!async_compute_fallback_enabled)
 		{
 			note_async_pipeline_unsupported_desc("compute async fallback disabled");
-			return _device->CreateComputePipelineState(desc, riid, pipeline_state);
+			return create_compute_pipeline_state_synchronously(desc, riid, pipeline_state);
 		}
+
+		const AsyncPipelineShaderHashes shader_hashes = get_shader_hashes(*desc);
+		if (are_all_shader_hashes_compiled(shader_hashes))
+			return create_compute_pipeline_state_synchronously(desc, riid, pipeline_state, &shader_hashes);
+
 		if (async_compute_shader_bytecode_threshold != 0 && desc->CS.BytecodeLength <= async_compute_shader_bytecode_threshold)
 		{
-			reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO: compute shader bytecode size=%zu bytes is below threshold=%llu bytes.", desc->CS.BytecodeLength, static_cast<unsigned long long>(async_compute_shader_bytecode_threshold));
+			if (async_pipeline_debug_diagnostics)
+				reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO: compute shader bytecode size=%zu bytes is below threshold=%llu bytes.", desc->CS.BytecodeLength, static_cast<unsigned long long>(async_compute_shader_bytecode_threshold));
 			note_async_pipeline_unsupported_desc("compute shader bytecode not over async threshold");
-			return _device->CreateComputePipelineState(desc, riid, pipeline_state);
+			return create_compute_pipeline_state_synchronously(desc, riid, pipeline_state, &shader_hashes);
 		}
 		const uint64_t compute_shaders_over_threshold = increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.compute_shaders_over_threshold, 1);
 		if (should_log_periodic(compute_shaders_over_threshold))
@@ -1799,7 +1881,7 @@ public:
 		if (!is_supported(working_desc, unsupported_reason, use_global_sentinel_fallback_pso))
 		{
 			note_async_pipeline_unsupported_desc(unsupported_reason);
-			return _device->CreateComputePipelineState(desc, riid, pipeline_state);
+			return create_compute_pipeline_state_synchronously(desc, riid, pipeline_state, &shader_hashes);
 		}
 
 		com_ptr<ID3D12PipelineState> fallback;
@@ -1808,7 +1890,7 @@ public:
 		{
 			increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.sync_fallback_failure, 1);
 			reshade::log::message(reshade::log::level::warning, "[ASYNC] Async D3D12 PSO: compute fallback creation failed with error code %s; falling back to synchronous real PSO creation.", reshade::log::hr_to_string(fallback_hr).c_str());
-			return _device->CreateComputePipelineState(desc, riid, pipeline_state);
+			return create_compute_pipeline_state_synchronously(desc, riid, pipeline_state, &shader_hashes);
 		}
 
 		const uint64_t id = _next_proxy_id.fetch_add(1, std::memory_order_relaxed);
@@ -1817,6 +1899,7 @@ public:
 		CompileJob job = {};
 		job.proxy = proxy;
 		job.compute_desc = std::make_unique<CopiedComputePipelineDesc>(working_desc);
+		job.shader_hashes = shader_hashes;
 		job.id = id;
 		enqueue_compile_job(std::move(job));
 
@@ -1839,11 +1922,18 @@ public:
 		if (FAILED(device2_hr))
 			return device2_hr;
 
+		const AsyncPipelineShaderHashes stream_shader_hashes = get_shader_hashes(*stream_desc);
+
 		if (riid != __uuidof(ID3D12PipelineState))
 		{
 			increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.sync_unsupported_interface, 1);
-			return device2->CreatePipelineState(stream_desc, riid, pipeline_state);
+			const HRESULT hr = device2->CreatePipelineState(stream_desc, riid, pipeline_state);
+			if (SUCCEEDED(hr))
+				mark_shader_hashes_compiled(stream_shader_hashes);
+			return hr;
 		}
+		if (are_all_shader_hashes_compiled(stream_shader_hashes))
+			return create_pipeline_state_stream_with_events(*stream_desc, device2.get(), pipeline_state, &stream_shader_hashes);
 
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics_desc = {};
 		bool graphics_has_cached_pso = false;
@@ -1874,7 +1964,6 @@ public:
 				note_async_pipeline_unsupported_desc(graphics_unsupported_reason);
 				goto sync_with_events;
 			}
-
 			com_ptr<ID3D12PipelineState> fallback;
 			const HRESULT fallback_hr = graphics_has_mesh_shader && use_global_sentinel_fallback_pso ? get_or_create_mesh_fallback(graphics_desc, fallback) : get_or_create_fallback(graphics_desc, fallback);
 			if (FAILED(fallback_hr))
@@ -1897,6 +1986,7 @@ public:
 			CompileJob job = {};
 			job.proxy = proxy;
 			job.stream_desc = std::move(copied_stream_desc);
+			job.shader_hashes = stream_shader_hashes;
 			job.id = id;
 			enqueue_compile_job(std::move(job));
 
@@ -1914,7 +2004,8 @@ public:
 			}
 			if (async_compute_shader_bytecode_threshold != 0 && compute_desc.CS.BytecodeLength <= async_compute_shader_bytecode_threshold)
 			{
-				reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO: compute stream shader bytecode size=%zu bytes is below threshold=%llu bytes.", compute_desc.CS.BytecodeLength, static_cast<unsigned long long>(async_compute_shader_bytecode_threshold));
+				if (async_pipeline_debug_diagnostics)
+					reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO: compute stream shader bytecode size=%zu bytes is below threshold=%llu bytes.", compute_desc.CS.BytecodeLength, static_cast<unsigned long long>(async_compute_shader_bytecode_threshold));
 				note_async_pipeline_unsupported_desc("compute stream shader bytecode not over async threshold");
 				goto sync_with_events;
 			}
@@ -1931,7 +2022,6 @@ public:
 				note_async_pipeline_unsupported_desc(compute_unsupported_reason);
 				goto sync_with_events;
 			}
-
 			com_ptr<ID3D12PipelineState> fallback;
 			const HRESULT fallback_hr = get_or_create_compute_fallback(compute_desc, fallback);
 			if (FAILED(fallback_hr))
@@ -1954,6 +2044,7 @@ public:
 			CompileJob job = {};
 			job.proxy = proxy;
 			job.stream_desc = std::move(copied_stream_desc);
+			job.shader_hashes = stream_shader_hashes;
 			job.id = id;
 			enqueue_compile_job(std::move(job));
 
@@ -1965,23 +2056,54 @@ public:
 		note_async_pipeline_unsupported_desc(graphics_unsupported_reason);
 
 sync_with_events:
-		return create_pipeline_state_stream_with_events(*stream_desc, device2.get(), pipeline_state);
+		return create_pipeline_state_stream_with_events(*stream_desc, device2.get(), pipeline_state, &stream_shader_hashes);
 	}
 
 private:
-	HRESULT create_pipeline_state_stream_with_events(const D3D12_PIPELINE_STATE_STREAM_DESC &stream_desc, ID3D12Device2 *device2, void **pipeline_state)
+	HRESULT create_graphics_pipeline_state_synchronously(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **pipeline_state, const AsyncPipelineShaderHashes *shader_hashes = nullptr, D3D12PipelineCreationTiming *timing = nullptr)
+	{
+		const HRESULT hr = invoke_timed_pipeline_creation(timing, D3D12PipelineCreationApi::graphics, [&]() {
+			return _device->CreateGraphicsPipelineState(desc, riid, pipeline_state);
+		});
+		if (SUCCEEDED(hr))
+			mark_shader_hashes_compiled(shader_hashes != nullptr ? *shader_hashes : get_shader_hashes(*desc));
+		return hr;
+	}
+
+	HRESULT create_compute_pipeline_state_synchronously(const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **pipeline_state, const AsyncPipelineShaderHashes *shader_hashes = nullptr, D3D12PipelineCreationTiming *timing = nullptr)
+	{
+		const HRESULT hr = invoke_timed_pipeline_creation(timing, D3D12PipelineCreationApi::compute, [&]() {
+			return _device->CreateComputePipelineState(desc, riid, pipeline_state);
+		});
+		if (SUCCEEDED(hr))
+			mark_shader_hashes_compiled(shader_hashes != nullptr ? *shader_hashes : get_shader_hashes(*desc));
+		return hr;
+	}
+
+	HRESULT create_pipeline_state_stream_with_events(const D3D12_PIPELINE_STATE_STREAM_DESC &stream_desc, ID3D12Device2 *device2, void **pipeline_state, const AsyncPipelineShaderHashes *shader_hashes = nullptr, D3D12PipelineCreationTiming *timing = nullptr)
 	{
 		HRESULT hr = S_OK;
 #if RESHADE_ADDON >= 2
 		ID3D12PipelineState *event_pipeline = nullptr;
-		if (_device_proxy->invoke_create_and_init_pipeline_event(stream_desc, event_pipeline, hr, true))
+		bool addon_override = false;
+		if (_device_proxy->invoke_create_and_init_pipeline_event(stream_desc, event_pipeline, hr, true, timing, &addon_override))
 		{
 			if (SUCCEEDED(hr))
+			{
 				*pipeline_state = event_pipeline;
+				// Add-on replacement may compile modified shaders.
+				if (!addon_override)
+					mark_shader_hashes_compiled(shader_hashes != nullptr ? *shader_hashes : get_shader_hashes(stream_desc));
+			}
 			return hr;
 		}
 #endif
-		return device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState **>(pipeline_state)));
+		hr = invoke_timed_pipeline_creation(timing, D3D12PipelineCreationApi::stream, [&]() {
+			return device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState **>(pipeline_state)));
+		});
+		if (SUCCEEDED(hr))
+			mark_shader_hashes_compiled(shader_hashes != nullptr ? *shader_hashes : get_shader_hashes(stream_desc));
+		return hr;
 	}
 
 	struct CompileJob
@@ -1999,6 +2121,7 @@ private:
 		std::unique_ptr<CopiedGraphicsPipelineDesc> graphics_desc;
 		std::unique_ptr<CopiedComputePipelineDesc> compute_desc;
 		std::unique_ptr<CopiedPipelineStateStream> stream_desc;
+		AsyncPipelineShaderHashes shader_hashes;
 		uint64_t id = 0;
 		std::atomic<State> state { State::queued };
 	};
@@ -2549,6 +2672,171 @@ private:
 		return hash;
 	}
 
+	static bool get_shader_container_digest(const D3D12_SHADER_BYTECODE &bytecode, uint64_t &identity_low, uint64_t &identity_high)
+	{
+		constexpr uint32_t dxbc_tag = uint32_t('D') | (uint32_t('X') << 8) | (uint32_t('B') << 16) | (uint32_t('C') << 24);
+		if (bytecode.pShaderBytecode == nullptr || bytecode.BytecodeLength < sizeof(uint32_t) * 8)
+			return false;
+
+		std::array<uint32_t, 8> header;
+		std::memcpy(header.data(), bytecode.pShaderBytecode, sizeof(header));
+		if (header[0] != dxbc_tag ||
+			header[5] != 0x00000001 ||
+			static_cast<uint64_t>(header[6]) != static_cast<uint64_t>(bytecode.BytecodeLength))
+			return false;
+
+		if (header[1] == 0 && header[2] == 0 && header[3] == 0 && header[4] == 0)
+			return false;
+
+		std::memcpy(&identity_low, header.data() + 1, sizeof(identity_low));
+		std::memcpy(&identity_high, header.data() + 3, sizeof(identity_high));
+		return true;
+	}
+
+	static const char *get_shader_stage_name(AsyncPipelineShaderStage stage)
+	{
+		switch (stage)
+		{
+		case AsyncPipelineShaderStage::vertex: return "VS";
+		case AsyncPipelineShaderStage::pixel: return "PS";
+		case AsyncPipelineShaderStage::domain: return "DS";
+		case AsyncPipelineShaderStage::hull: return "HS";
+		case AsyncPipelineShaderStage::geometry: return "GS";
+		case AsyncPipelineShaderStage::compute: return "CS";
+		case AsyncPipelineShaderStage::amplification: return "AS";
+		case AsyncPipelineShaderStage::mesh: return "MS";
+		default: return "unknown";
+		}
+	}
+
+	static void add_shader_hash(AsyncPipelineShaderHashes &hashes, AsyncPipelineShaderStage stage, const D3D12_SHADER_BYTECODE &bytecode)
+	{
+		if ((bytecode.pShaderBytecode == nullptr) != (bytecode.BytecodeLength == 0))
+		{
+			hashes.available = false;
+			return;
+		}
+		if (bytecode.pShaderBytecode == nullptr)
+			return;
+		if (hashes.count == hashes.keys.size())
+		{
+			hashes.available = false;
+			return;
+		}
+
+		AsyncPipelineShaderKey &key = hashes.keys[hashes.count++];
+		key.size = static_cast<uint64_t>(bytecode.BytecodeLength);
+		key.stage = stage;
+
+		bool has_container_digest;
+		has_container_digest = get_shader_container_digest(bytecode, key.identity_low, key.identity_high);
+
+		if (has_container_digest)
+		{
+			key.identity_kind = AsyncPipelineShaderIdentityKind::container_digest;
+		}
+		else
+		{
+			if (async_pipeline_debug_diagnostics)
+				reshade::log::message(reshade::log::level::info,
+					"[ASYNC] Heuristic shader identity fallback: stage=%s shader_bytes=%zu; container digest unavailable, hashing full bytecode.",
+					get_shader_stage_name(stage), bytecode.BytecodeLength);
+			key.identity_low = hash_bytes(bytecode.pShaderBytecode, bytecode.BytecodeLength);
+			key.identity_high = 0;
+			key.identity_kind = AsyncPipelineShaderIdentityKind::full_hash;
+		}
+	}
+
+	static AsyncPipelineShaderHashes get_shader_hashes(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc)
+	{
+		AsyncPipelineShaderHashes hashes;
+		hashes.available = true;
+		add_shader_hash(hashes, AsyncPipelineShaderStage::vertex, desc.VS);
+		add_shader_hash(hashes, AsyncPipelineShaderStage::pixel, desc.PS);
+		add_shader_hash(hashes, AsyncPipelineShaderStage::domain, desc.DS);
+		add_shader_hash(hashes, AsyncPipelineShaderStage::hull, desc.HS);
+		add_shader_hash(hashes, AsyncPipelineShaderStage::geometry, desc.GS);
+		return hashes;
+	}
+
+	static AsyncPipelineShaderHashes get_shader_hashes(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc)
+	{
+		AsyncPipelineShaderHashes hashes;
+		hashes.available = true;
+		add_shader_hash(hashes, AsyncPipelineShaderStage::compute, desc.CS);
+		return hashes;
+	}
+
+	static AsyncPipelineShaderHashes get_shader_hashes(const D3D12_PIPELINE_STATE_STREAM_DESC &desc)
+	{
+		AsyncPipelineShaderHashes hashes;
+		hashes.available = true;
+		if (desc.pPipelineStateSubobjectStream == nullptr || desc.SizeInBytes == 0)
+		{
+			hashes.available = false;
+			return hashes;
+		}
+
+		const uint8_t *const stream = static_cast<const uint8_t *>(desc.pPipelineStateSubobjectStream);
+		for (size_t offset = 0; offset < desc.SizeInBytes;)
+		{
+			if (desc.SizeInBytes - offset < sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE))
+			{
+				hashes.available = false;
+				return hashes;
+			}
+
+			D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+			std::memcpy(&type, stream + offset, sizeof(type));
+			const size_t size = CopiedPipelineStateStream::subobject_size(type);
+			if (size == 0 || size > desc.SizeInBytes - offset)
+			{
+				hashes.available = false;
+				return hashes;
+			}
+
+			const uintptr_t p = reinterpret_cast<uintptr_t>(stream + offset);
+			switch (type)
+			{
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: add_shader_hash(hashes, AsyncPipelineShaderStage::vertex, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_VS *>(p)->data); break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: add_shader_hash(hashes, AsyncPipelineShaderStage::pixel, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_PS *>(p)->data); break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: add_shader_hash(hashes, AsyncPipelineShaderStage::domain, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DS *>(p)->data); break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: add_shader_hash(hashes, AsyncPipelineShaderStage::hull, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_HS *>(p)->data); break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: add_shader_hash(hashes, AsyncPipelineShaderStage::geometry, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_GS *>(p)->data); break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: add_shader_hash(hashes, AsyncPipelineShaderStage::compute, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_CS *>(p)->data); break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: add_shader_hash(hashes, AsyncPipelineShaderStage::amplification, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_AS *>(p)->data); break;
+			case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: add_shader_hash(hashes, AsyncPipelineShaderStage::mesh, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_MS *>(p)->data); break;
+			default: break;
+			}
+			if (!hashes.available)
+				return hashes;
+
+			offset += size;
+		}
+
+		return hashes;
+	}
+
+	bool are_all_shader_hashes_compiled(const AsyncPipelineShaderHashes &hashes)
+	{
+		if (!hashes.available || hashes.count == 0)
+			return false;
+
+		for (size_t i = 0; i < hashes.count; ++i)
+			if (!_compiled_shader_hashes.if_contains(hashes.keys[i], [](const auto &) {}))
+				return false;
+		return true;
+	}
+
+	void mark_shader_hashes_compiled(const AsyncPipelineShaderHashes &hashes)
+	{
+		if (!hashes.available)
+			return;
+
+		for (size_t i = 0; i < hashes.count; ++i)
+			_compiled_shader_hashes.try_emplace(hashes.keys[i], true);
+	}
+
 	static void log_shader_bytecode(uint64_t id, const char *name, const D3D12_SHADER_BYTECODE &bytecode)
 	{
 		if (async_pipeline_debug_diagnostics)
@@ -2819,17 +3107,17 @@ private:
 				info_queue_lock.lock();
 				first_info_queue_message = get_info_queue_message_count(_info_queue.get());
 			}
-			const auto compile_start = std::chrono::steady_clock::now();
 			HRESULT hr = E_FAIL;
 			bool handled_by_addon_events = false;
+			bool addon_override = false;
 #if RESHADE_ADDON >= 2
 			ID3D12PipelineState *event_pipeline = nullptr;
 			if (job->stream_desc != nullptr)
-				handled_by_addon_events = _device_proxy->invoke_create_and_init_pipeline_event(job->stream_desc->desc, event_pipeline, hr, true);
+				handled_by_addon_events = _device_proxy->invoke_create_and_init_pipeline_event(job->stream_desc->desc, event_pipeline, hr, true, nullptr, &addon_override);
 			else if (job->graphics_desc != nullptr)
-				handled_by_addon_events = _device_proxy->invoke_create_and_init_pipeline_event(job->graphics_desc->desc, event_pipeline, hr, true);
+				handled_by_addon_events = _device_proxy->invoke_create_and_init_pipeline_event(job->graphics_desc->desc, event_pipeline, hr, true, nullptr, &addon_override);
 			else if (job->compute_desc != nullptr)
-				handled_by_addon_events = _device_proxy->invoke_create_and_init_pipeline_event(job->compute_desc->desc, event_pipeline, hr, true);
+				handled_by_addon_events = _device_proxy->invoke_create_and_init_pipeline_event(job->compute_desc->desc, event_pipeline, hr, true, nullptr, &addon_override);
 
 			if (handled_by_addon_events && SUCCEEDED(hr))
 				real = com_ptr<ID3D12PipelineState>(event_pipeline, true);
@@ -2839,32 +3127,38 @@ private:
 				com_ptr<ID3D12Device2> device2;
 				hr = _device->QueryInterface(&device2);
 				if (SUCCEEDED(hr))
-					hr = device2->CreatePipelineState(&job->stream_desc->desc, IID_PPV_ARGS(&real));
+					hr = invoke_timed_pipeline_creation(nullptr, D3D12PipelineCreationApi::stream, [&]() {
+						return device2->CreatePipelineState(&job->stream_desc->desc, IID_PPV_ARGS(&real));
+					});
 			}
 			else if (!handled_by_addon_events && job->graphics_desc != nullptr)
 			{
-				hr = _device->CreateGraphicsPipelineState(&job->graphics_desc->desc, IID_PPV_ARGS(&real));
+				hr = invoke_timed_pipeline_creation(nullptr, D3D12PipelineCreationApi::graphics, [&]() {
+					return _device->CreateGraphicsPipelineState(&job->graphics_desc->desc, IID_PPV_ARGS(&real));
+				});
 			}
 			else if (!handled_by_addon_events && job->compute_desc != nullptr)
 			{
-				hr = _device->CreateComputePipelineState(&job->compute_desc->desc, IID_PPV_ARGS(&real));
+				hr = invoke_timed_pipeline_creation(nullptr, D3D12PipelineCreationApi::compute, [&]() {
+					return _device->CreateComputePipelineState(&job->compute_desc->desc, IID_PPV_ARGS(&real));
+				});
 			}
-			const auto compile_end = std::chrono::steady_clock::now();
 			g_async_pipeline_callback_job_id = 0;
-			const uint64_t compile_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(compile_end - compile_start).count());
-			update_atomic_max(g_async_pipeline_diagnostics.async_compile_max_us, compile_us);
 			if (SUCCEEDED(hr))
 			{
 				const uint64_t success_count = increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.async_compile_successes, 1);
-				increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.async_compile_total_us, compile_us);
+				// Add-on replacement may compile modified shaders, so only publish the
+				// original identities when this path made the corresponding native call.
+				if (!handled_by_addon_events || !addon_override)
+					mark_shader_hashes_compiled(job->shader_hashes);
 				job->proxy->set_real(real.get());
 				if (should_log_periodic(success_count))
-					reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO proxy %llu: real PSO published (compile_ms=%.3f, addon_events=%u).", static_cast<unsigned long long>(job->id), static_cast<double>(compile_us) / 1000.0, handled_by_addon_events);
+					reshade::log::message(reshade::log::level::info, "[ASYNC] Async D3D12 PSO proxy %llu: real PSO published (addon_events=%u).", static_cast<unsigned long long>(job->id), handled_by_addon_events);
 			}
 			else
 			{
 				increment_async_pipeline_diagnostic(g_async_pipeline_diagnostics.async_compile_failures, 1);
-				reshade::log::message(reshade::log::level::warning, "[ASYNC] Async D3D12 PSO proxy %llu: real PSO creation failed with error code %s; keeping fallback bound (handled_by_addon_events=%u, compile_ms=%.3f).", static_cast<unsigned long long>(job->id), reshade::log::hr_to_string(hr).c_str(), handled_by_addon_events, static_cast<double>(compile_us) / 1000.0);
+				reshade::log::message(reshade::log::level::warning, "[ASYNC] Async D3D12 PSO proxy %llu: real PSO creation failed with error code %s; keeping fallback bound (handled_by_addon_events=%u).", static_cast<unsigned long long>(job->id), reshade::log::hr_to_string(hr).c_str(), handled_by_addon_events);
 				// The info queue is only exposed when the D3D12 debug layer is active. If it is
 				// available, always report its validation reason, independently of [ASYNC] Debug.
 				if (_info_queue1 != nullptr)
@@ -3008,6 +3302,7 @@ private:
 		queued_job->graphics_desc = std::move(job.graphics_desc);
 		queued_job->compute_desc = std::move(job.compute_desc);
 		queued_job->stream_desc = std::move(job.stream_desc);
+		queued_job->shader_hashes = job.shader_hashes;
 		queued_job->id = job.id;
 		std::shared_lock<std::shared_mutex> lifecycle_lock(_compile_lifecycle_mutex);
 		if (_stop.load(std::memory_order_acquire))
@@ -3112,6 +3407,7 @@ private:
 	AsyncPipelineSentinelState _global_compute_fallback_state = AsyncPipelineSentinelState::not_started;
 	com_ptr<ID3D12PipelineState> _global_compute_fallback;
 	AsyncPipelineFallbackNodeMap<ComputeFallbackKey, com_ptr<ID3D12PipelineState>, ComputeFallbackKeyHash> _compute_fallback_cache;
+	AsyncPipelineParallelNodeMap<AsyncPipelineShaderKey, bool, AsyncPipelineShaderKeyHash> _compiled_shader_hashes;
 	moodycamel::ConcurrentQueue<CompileJobPtr> _normal_compile_queue;
 	moodycamel::ConcurrentQueue<CompileJobPtr> _urgent_compile_queue;
 	moodycamel::LightweightSemaphore _compile_work_semaphore { 0 };

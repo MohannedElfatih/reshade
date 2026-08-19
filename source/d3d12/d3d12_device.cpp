@@ -19,6 +19,7 @@
 #include "addon_manager.hpp"
 #include <cwchar> // std::wcslen
 #include <algorithm> // std::find_if
+#include <chrono>
 #include <utf8/unchecked.h>
 
 using reshade::d3d12::to_handle;
@@ -2808,8 +2809,13 @@ bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_STATE_OBJECT
 
 	return true;
 }
-bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_PIPELINE_STATE_STREAM_DESC &internal_desc, ID3D12PipelineState *&d3d_pipeline, HRESULT &hr, bool with_create_pipeline)
+bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_PIPELINE_STATE_STREAM_DESC &internal_desc, ID3D12PipelineState *&d3d_pipeline, HRESULT &hr, bool with_create_pipeline, D3D12PipelineCreationTiming *timing, bool *addon_override)
 {
+	if (timing != nullptr)
+		*timing = {};
+	if (addon_override != nullptr)
+		*addon_override = false;
+
 	if (!reshade::has_addon_event<reshade::addon_event::init_pipeline>() &&
 		!reshade::has_addon_event<reshade::addon_event::destroy_pipeline>() &&
 		(with_create_pipeline && !reshade::has_addon_event<reshade::addon_event::create_pipeline>()))
@@ -3011,6 +3017,10 @@ bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_PIPELINE_STA
 	{
 		if (reshade::invoke_addon_event<reshade::addon_event::create_pipeline>(this, layout, static_cast<uint32_t>(subobjects.size()), subobjects.data()))
 		{
+			if (timing != nullptr)
+				timing->addon_override = true;
+			if (addon_override != nullptr)
+				*addon_override = true;
 			reshade::api::pipeline pipeline;
 			hr = device_impl::create_pipeline(layout, static_cast<uint32_t>(subobjects.size()), subobjects.data(), &pipeline) ? S_OK : E_FAIL;
 			d3d_pipeline = reinterpret_cast<ID3D12PipelineState *>(pipeline.handle);
@@ -3020,7 +3030,18 @@ bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_PIPELINE_STA
 			if (!check_and_upgrade_interface(__uuidof(ID3D12Device2)))
 				return false;
 
-			hr = static_cast<ID3D12Device2 *>(_orig)->CreatePipelineState(&internal_desc, IID_PPV_ARGS(&d3d_pipeline));
+			if (timing != nullptr)
+			{
+				const auto create_start = std::chrono::steady_clock::now();
+				hr = static_cast<ID3D12Device2 *>(_orig)->CreatePipelineState(&internal_desc, IID_PPV_ARGS(&d3d_pipeline));
+				timing->duration_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - create_start).count());
+				timing->api = D3D12PipelineCreationApi::stream;
+				timing->available = true;
+			}
+			else
+			{
+				hr = static_cast<ID3D12Device2 *>(_orig)->CreatePipelineState(&internal_desc, IID_PPV_ARGS(&d3d_pipeline));
+			}
 		}
 	}
 	else
@@ -3043,7 +3064,7 @@ bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_PIPELINE_STA
 
 	return true;
 }
-bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_COMPUTE_PIPELINE_STATE_DESC &internal_desc, ID3D12PipelineState *&d3d_pipeline, HRESULT &hr, bool with_create_pipeline)
+bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_COMPUTE_PIPELINE_STATE_DESC &internal_desc, ID3D12PipelineState *&d3d_pipeline, HRESULT &hr, bool with_create_pipeline, D3D12PipelineCreationTiming *timing, bool *addon_override)
 {
 	struct
 	{
@@ -3062,9 +3083,9 @@ bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_COMPUTE_PIPE
 		{ internal_desc.Flags }
 	};
 
-	return invoke_create_and_init_pipeline_event(D3D12_PIPELINE_STATE_STREAM_DESC { sizeof(stream_data), &stream_data }, d3d_pipeline, hr, with_create_pipeline);
+	return invoke_create_and_init_pipeline_event(D3D12_PIPELINE_STATE_STREAM_DESC { sizeof(stream_data), &stream_data }, d3d_pipeline, hr, with_create_pipeline, timing, addon_override);
 }
-bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &internal_desc, ID3D12PipelineState *&d3d_pipeline, HRESULT &hr, bool with_create_pipeline)
+bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &internal_desc, ID3D12PipelineState *&d3d_pipeline, HRESULT &hr, bool with_create_pipeline, D3D12PipelineCreationTiming *timing, bool *addon_override)
 {
 	struct
 	{
@@ -3113,7 +3134,7 @@ bool D3D12Device::invoke_create_and_init_pipeline_event(const D3D12_GRAPHICS_PIP
 		{ internal_desc.Flags }
 	};
 
-	return invoke_create_and_init_pipeline_event(D3D12_PIPELINE_STATE_STREAM_DESC { sizeof(stream_data), &stream_data }, d3d_pipeline, hr, with_create_pipeline);
+	return invoke_create_and_init_pipeline_event(D3D12_PIPELINE_STATE_STREAM_DESC { sizeof(stream_data), &stream_data }, d3d_pipeline, hr, with_create_pipeline, timing, addon_override);
 }
 
 bool D3D12Device::invoke_create_and_init_pipeline_layout_event(UINT node_mask, const void *blob, size_t blob_size, ID3D12RootSignature *&root_signature, HRESULT &hr)

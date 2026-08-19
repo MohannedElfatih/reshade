@@ -6,9 +6,26 @@
 #pragma once
 
 #include "d3d12_impl_device.hpp"
+#include <cstdint>
 
 class D3D12DeviceDownlevel;
 class D3D12AsyncPipelineManager;
+
+enum class D3D12PipelineCreationApi : uint8_t
+{
+	unavailable,
+	graphics,
+	compute,
+	stream,
+};
+
+struct D3D12PipelineCreationTiming
+{
+	uint64_t duration_us = 0;
+	D3D12PipelineCreationApi api = D3D12PipelineCreationApi::unavailable;
+	bool available = false;
+	bool addon_override = false;
+};
 
 class DECLSPEC_UUID("2523AFF4-978B-4939-BA16-8EE876A4CB2A") D3D12Device final : public ID3D12Device15, public reshade::d3d12::device_impl
 {
@@ -156,9 +173,9 @@ public:
 #endif
 #if RESHADE_ADDON >= 2
 	bool invoke_create_and_init_pipeline_event(const D3D12_STATE_OBJECT_DESC &desc, ID3D12StateObject *existing_state_object, ID3D12StateObject *&state_object, HRESULT &hr);
-	bool invoke_create_and_init_pipeline_event(const D3D12_PIPELINE_STATE_STREAM_DESC &desc, ID3D12PipelineState *&pipeline, HRESULT &hr, bool with_create_pipeline);
-	bool invoke_create_and_init_pipeline_event(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, ID3D12PipelineState *&pipeline, HRESULT &hr, bool with_create_pipeline);
-	bool invoke_create_and_init_pipeline_event(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, ID3D12PipelineState *&pipeline, HRESULT &hr, bool with_create_pipeline);
+	bool invoke_create_and_init_pipeline_event(const D3D12_PIPELINE_STATE_STREAM_DESC &desc, ID3D12PipelineState *&pipeline, HRESULT &hr, bool with_create_pipeline, D3D12PipelineCreationTiming *timing = nullptr, bool *addon_override = nullptr);
+	bool invoke_create_and_init_pipeline_event(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, ID3D12PipelineState *&pipeline, HRESULT &hr, bool with_create_pipeline, D3D12PipelineCreationTiming *timing = nullptr, bool *addon_override = nullptr);
+	bool invoke_create_and_init_pipeline_event(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, ID3D12PipelineState *&pipeline, HRESULT &hr, bool with_create_pipeline, D3D12PipelineCreationTiming *timing = nullptr, bool *addon_override = nullptr);
 	bool invoke_create_and_init_pipeline_layout_event(UINT node_mask, const void *blob, size_t blob_size, ID3D12RootSignature *&root_signature, HRESULT &hr);
 #endif
 

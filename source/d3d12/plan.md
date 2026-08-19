@@ -89,9 +89,24 @@ non-dispatch because command-signature contents are not tracked here. Allowing
 fallback commands is intended for keyed pipeline classes that have been proven
 compatible; a mesh pipeline cannot execute through a classic VS/PS substitute.
 
-Compute pipelines are asynchronous only when their compute shader bytecode is at
-least 64 KiB (`ComputeShaderBytecodeThreshold=65536`). Smaller classic and stream
-compute pipelines compile synchronously to avoid queueing inexpensive shaders.
+When safe mode is enabled, compute pipelines are asynchronous only when their
+compute shader bytecode exceeds the configured `ComputeShaderBytecodeThreshold`.
+Smaller classic and stream compute pipelines compile synchronously to avoid
+queueing inexpensive shaders. Disabling safe mode disables this threshold while
+leaving all other async eligibility checks intact.
+
+Each manager maintains a device-local registry keyed by shader stage, bytecode
+size, and shader identity. Normal DXBC/DXIL containers use the nonzero 128-bit
+digest from their validated fixed header, so identity extraction does not scale
+with shader size. Missing, malformed, or zero-digest containers fall back to a
+full-byte hash. Successful native synchronous creation calls and successful
+native compile-worker calls publish their shader identities only after the driver
+call returns. An otherwise asynchronous PSO whose every shader identity is
+already present is created synchronously. The identity check precedes safe-mode
+heuristics; unknown and in-flight shaders continue through normal eligibility
+checks. This mechanism does not relax any structural compatibility gate, and
+add-on-replaced creation does not publish identities when no exact native driver
+call can be identified.
 
 ## Add-on compatibility contract
 
@@ -133,6 +148,13 @@ Detailed counters and hot-path timing are enabled only by `[ASYNC] Debug=1`.
 Periodic tables and repetitive event summaries use a 512-event cadence without
 an initial burst. Deferred `StorePipeline` failures follow the same policy, while
 rare native creation failures remain visible.
+
+With `[ASYNC] Debug=1`, each DXBC/DXIL container-digest lookup logs its measured
+duration in nanoseconds, and full-byte identity fallback is logged when the fixed
+header digest is unavailable. Completed-shader identity hits do not emit log
+lines. Pipeline creation timing is currently disabled, and the null timing path
+invokes the native callback directly without reading the clock. Shader identity
+reuse does not change queue ordering or worker count.
 
 Queue diagnostics time only direct concurrent-queue enqueue/dequeue calls and
 warn at 10 ms. Queue age is expected backlog and is not treated as queue
